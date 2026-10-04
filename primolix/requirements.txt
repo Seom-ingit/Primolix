@@ -1,0 +1,24 @@
+# primolix 包依赖声明
+#
+# 设计目标仍是「零编码、可发布」——但**"零依赖"不等于"不声明依赖"**。
+# 未声明时的实际后果：装到干净机器上，jieba 缺失会让中文检索**静默退化**
+# （v0.1.0 下正文汉字整块成一个 token，子串查询零命中且不报错）。
+# 见 primolix/kernel.py:simple_tokenize 的注释与 docs/16 §13.2-X2。
+
+# ── 必需：S1 稀疏内核（scipy CSR） ──────────────────────────────
+numpy>=1.24
+scipy>=1.10          # 缺失时 SparseBM25 直接 RuntimeError（不是降级）
+
+# ── 强烈建议：中文分词 ────────────────────────────────────────
+# 缺失时降级为 simple_cjk_bigram（字 + 相邻二元），可用但精度低于 jieba；
+# 该降级会通过 primolix.kernel.tokenizer_status() 暴露，必须映射为
+# retrieval-contract 的 degradation.capability = "tokenizer"。
+jieba>=0.42
+
+# ── 可选：dense 精排（S3） ────────────────────────────────────
+# 缺失或模型未下载时自动降级为 BM25-only，不报错。
+# sentence-transformers>=2.2
+
+# ── 可选：并行分词的内存感知 worker 数 ───────────────────────
+# 缺失时 auto_workers() 退化为「只看 CPU 核数」。
+# psutil>=5.9

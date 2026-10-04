@@ -1,0 +1,77 @@
+# Things the release repo must ignore (scratch, large files, internal notes).
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- research scratch (not published) ---
+.probe-work/
+research/.dbg/
+research/.dbg_guard/
+01_tiered_storage/.dbg/
+01_tiered_storage/.dbg_guard/
+01_tiered_storage/__pycache__/
+*.npy
+*.npz
+*.mm
+*.bin
+# large intermediates written by probes
+*_child_cur.npy
+_tmp_*.npz
+
+# --- index artefacts (rebuildable, never committed) ---
+.idx/
+.primolix_index/
+.zelix_index/
+deriv/csc/
+seg/
+*.csc.npz
+# scratch dirs created when the shipped tests / examples run
+tests/_unit_run/
+tests/_e2e_run/
+tests/_staged_run/
+
+# ---------------------------------------------------------------- 维护者资产（不进公开仓）
+# 一次性迁移/诊断脚本与内部清单：含绝对路径、workspace 进度文件引用与维护者自用步骤，
+# 对使用者无意义（`rename_to_primolix.ps1` 是改名一次性脚本，项目已叫 primolix）。
+_clean_pkg.py
+_compile_all.py
+_diag_trim.py
+_fix_leftover_zelix.py
+_inspect_*.py
+_patch_logging.py
+_rename_class.py
+_repin_imports.py
+_trim_comments.py
+rename_to_primolix.ps1
+upload_checklist.md
+*_missing.md
+examples/_run/
+examples/_lineage_run/
+.lineage/
+
+# --- 未随本发布包提供（留在源工作区）---
+# 层次血缘索引这一层尚未进入发布件：`primolix/lineage.py` 没有回归测试、未进 CI，
+# 所以本次不随包提供（源码留在工作区，将来可能进包）。
+primolix/lineage.py
+examples/run_lineage_example.py
+
+# --- maintainer-only workspace files (deliberately untracked) ---
+AGENTS.md
+_范式/
+CROSS_HELIX_*.md
+
+# --- credentials / logs ---
+*.log
+logs/
+.env
+*.key
+*_token*
