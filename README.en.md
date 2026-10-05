@@ -333,7 +333,7 @@ python tests/test_staged_publish.py   # staged publish: mount / fold / unmount, 
 ```
 
 All three print `PASS` / `FAIL` per check and exit non-zero on failure. No external data is needed.
-Coverage: kernel **U1-U22** (including segment mount / fold / unmount, U10-U12; U20 pins "load then
+Coverage: kernel **U1-U23** (including segment mount / fold / unmount, U10-U12; U20 pins "load then
 update again" and "a `.mm/` generation-key mismatch is refused"), plus 10 end-to-end checks and
 7 staged-publish checks (T1-T7) at the index layer. **Not covered**: the view family.
 

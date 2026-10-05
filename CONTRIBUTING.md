@@ -13,7 +13,7 @@ python -m compileall -q primolix                 # 语法体检
 ```
 
 三个测试脚本都不需要外部数据，逐项打印 `PASS`/`FAIL`，有失败就返回非零 —— CI 直接跑它们：
-`tests/test_kernel_unit.py`（**22 项**，U1–U22）、`tests/test_staged_publish.py`（**7 项**，T1–T7）、
+`tests/test_kernel_unit.py`（**23 项**，U1–U23）、`tests/test_staged_publish.py`（**7 项**，T1–T7）、
 `tests/test_primolix_e2e.py`（**10 项**，1a/1b/2–9）。
 
 ## 改代码时的七条红线
@@ -37,7 +37,7 @@ python -m compileall -q primolix                 # 语法体检
 ## 测试怎么写
 
 - 三个入口：`tests/test_primolix_e2e.py`（端到端，10 项）、`tests/test_kernel_unit.py`（内核不变量，
-  22 项 U1–U22）、`tests/test_staged_publish.py`（段式发布，7 项 T1–T7）。
+  23 项 U1–U23）、`tests/test_staged_publish.py`（段式发布，7 项 T1–T7）。
 - **参数形态别记错**：内核是 `score_all(qtoks)`（**token 列表**），索引层是 `query(text)`（**文本**）。
   给内核传字符串会被当成字符集合，静默全 0 分（历史教训：测试里出现过一次）。
 - **对照组的状态要与被测组一致**（写测试时也要做"活跃集对齐"）。

@@ -27,6 +27,7 @@ Checks (each prints PASS/FAIL; process exits 1 if anything fails):
   U20 load-then-update still works (dead is writable); a `.mm/` generation-key mismatch is refused (never a silent mixed-generation read)
   U21 appending in place while a segment is mounted is refused loudly (it overlaps the segment's rows)
   U22 saving while a segment is mounted is refused loudly; `fold_all()` makes it durable, reload stays bit-exact (no double counting)
+  U23 the build-time tokenization mode is persisted; an absent field means off (old indexes)
 
   Not covered here: the view family (see docs/api.md).
 """
@@ -559,6 +560,24 @@ check("U22 段在场时 save() 响亮拒绝；fold_all() 后可落盘且重载�
       f"两段 → save 被拒={_save_refused}（{_save_msg!r}）· fold_all rows={_fo22.get('rows')}"
       f" · 折后↔折前 {_d22f:.3e} · 重载后↔折前 {_d22r:.3e}"
       f" · 重载后已挂段={sorted(_bm22b.segment_report())} · N {int(_bm22.N)}→{int(_bm22b.N)}")
+
+# ------------------------- U23 建库分词档随索引落盘；缺字段按 off（旧索引兼容）
+_h23 = run / "u23"
+_h23.mkdir(parents=True, exist_ok=True)
+_bm23 = SparseBM25(list(DOCS), tok, stream="ids")
+_p23 = _h23 / "bm25.npz"
+_bm23.save(str(_p23))
+_bm23b = SparseBM25.load(str(_p23))
+with np.load(_p23, allow_pickle=True) as _zf23:
+    _no_field23 = {k: _zf23[k] for k in _zf23.files if k != "stream_mode"}
+np.savez_compressed(_h23 / "legacy.npz", **_no_field23)
+_bm23c = SparseBM25.load(str(_h23 / "legacy.npz"))
+check("U23 建库分词档随索引落盘；缺字段按 off（旧索引兼容）",
+      getattr(_bm23, "stream_mode", None) == "ids"
+      and getattr(_bm23b, "stream_mode", None) == "ids"
+      and getattr(_bm23c, "stream_mode", None) == "off",
+      f"建库={getattr(_bm23, 'stream_mode', None)!r} · 重载={getattr(_bm23b, 'stream_mode', None)!r}"
+      f" · 缺字段={getattr(_bm23c, 'stream_mode', None)!r}")
 
 print("-" * 60)
 print("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS))
