@@ -146,7 +146,8 @@ def _load(out):
 def _cmd_index(args):
     Primolix.build(args.root, args.out, dense=args.dense,
                    model_path=args.model, workers=args.workers,
-                   w_cache=bool(getattr(args, "w_cache", False)))   # 物化层 w 落盘（opt-in）
+                   w_cache=bool(getattr(args, "w_cache", False)),   # 物化层 w 落盘（opt-in）
+                   stream=getattr(args, "stream", False))           # 建库峰值内存档（off/on/ids）
     _ok('建索引完成')
 
 
@@ -352,6 +353,9 @@ def main(argv=None):
     sp.add_argument('--workers', type=int, default=0)
     sp.add_argument('--w-cache', dest='w_cache', action='store_true',
                     help='同时把物化层 w 落盘（冷启动首查快 ~77×；盘 +nnz×4 B，1M 段约 +165MB）')
+    sp.add_argument('--stream', choices=['off', 'on', 'ids'], default='off',
+                    help='建库峰值内存档（不改分数）：off=分词一次并缓存（默认，峰值最高）· '
+                         'on=两遍不驻留（低，但 jieba 跑两遍）· ids=分词一次即转 id（最低档，推荐）')
     sp = sub.add_parser('query', help='检索')
     sp.add_argument('q')
     sp.add_argument('--out', default=None)

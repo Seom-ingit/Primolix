@@ -340,10 +340,14 @@ def open_index(path, *, dense: bool = False, model_path: str = "") -> Index:
 
 def build_index(root, out: str = ".primolix_index", *, dense: bool = False,
                 w_cache: bool = False, workers: int = 0,
+                stream=False,
                 model_path: str = "") -> Index:
-    """建索引并返回门面对象。`w_cache=True` → 建库时把物化层一并落盘。"""
+    r"""建索引并返回门面对象。`w_cache=True` → 建库时把物化层一并落盘。
+
+    `stream` 只改建库期的分词档（`False` / `True` / `"ids"`），不改分数。
+    """
     z = Primolix.build(root, out=out, dense=dense, model_path=model_path,
-                       workers=workers, w_cache=w_cache)
+                       workers=workers, w_cache=w_cache, stream=stream)
     idx = Index.__new__(Index)                 # 复用刚建好的对象，避免二次装载
     idx.dir = Path(out)
     idx._lock = RWLock()

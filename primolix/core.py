@@ -171,6 +171,40 @@ def scan_root(root: Path, skip_dirs=None):
 
 # ---------------- Primolix 索引对象 ----------------
 
+def _norm_stream(v):
+    r"""建库分词档归一：`False` / `True` / `"ids"` (也收 `off`/`on`/`ids` 字串)。
+
+    只改建库期的分词驻留方式, 不改分数; 非法值报错, 不静默回落。
+    """
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("ids", "id"):
+            return "ids"
+        if s in ("1", "true", "on", "yes"):
+            return True
+        if s in ("0", "false", "off", "no", ""):
+            return False
+        raise ValueError(f"stream 只接受 off/on/ids，实得 {v!r}")
+    return "ids" if v == "ids" else bool(v)
+
+
+def _topk_idx(x, k):
+    r"""取前 k 大的下标 (分数降序; 并列按下标升序)。
+
+    用 `argpartition` 而非 `argsort`: 只要前 k 个, 不必全排序。
+    返回的分数值与原全量排序相同 (并列时取哪些行号本就不保证)。
+    """
+    n = int(x.size)
+    k = int(min(max(k, 0), n))
+    if k <= 0:
+        return np.zeros(0, dtype=np.int64)
+    if k >= n:
+        idx = np.arange(n, dtype=np.int64)
+    else:
+        idx = np.argpartition(-x, k - 1)[:k].astype(np.int64, copy=False)
+    return idx[np.lexsort((idx, -x[idx]))]
+
+
 class Primolix:
     """零编码检索索引的 Python API：`build` / `query` / `browse` / `update` / `info`。
 
@@ -183,6 +217,7 @@ class Primolix:
         self.dir = Path(index_dir)
         self._bm = None
         self._meta = None
+        self._rows = None          # 活跃 chunk 的物理行号缓存 (每个 `self._meta =` 点置 None)
         self._hashes = None
         self._vecs = None
         self._dense = dense
@@ -192,10 +227,18 @@ class Primolix:
 
     @classmethod
     def build(cls, root, out='.primolix_index', dense=False, model_path='',
-              workers=0, skip_dirs=None, w_cache=False):
-        """建索引。`w_cache=True` → 同时把物化层 `w` 落盘（代价：盘 +`nnz×4 B`，默认关）。"""
+              workers=0, skip_dirs=None, w_cache=False, stream=False):
+        r"""建索引。`w_cache=True` → 同时把物化层 `w` 落盘（代价：盘 +`nnz×4 B`，默认关）。
+
+        `stream` 控制分词期是否驻留 token（不改分数，只改建库内存峰值）：
+          `False`（默认）＝ 分词一次并缓存，峰值最高；
+          `True` ＝ 两遍各自分词、不驻留，代价是 jieba 跑两遍；
+          `"ids"` ＝ 分词一次、立刻转 id、只留 `int32`，峰值最低且不重分词。
+        该选择随索引落盘，重载后由 OOV 触发的重建继续用它。
+        """
         self = cls(out, dense=dense, model_path=model_path)
         self._w_cache = bool(w_cache)
+        self._stream = _norm_stream(stream)
         t0 = time.time()
         _say("扫描文件...")
         files = scan_root(Path(root), skip_dirs)
@@ -207,8 +250,10 @@ class Primolix:
                                    file=r, line=ln, text=t))
         self.dir.mkdir(parents=True, exist_ok=True)
         _say("构建 BM25 词表...")
-        self._bm = SparseBM25([c['text'] for c in chunks], zh_tokenize, workers=workers)
+        self._bm = SparseBM25([c['text'] for c in chunks], zh_tokenize,
+                              workers=workers, stream=self._stream)
         self._meta = chunks
+        self._rows = None
         self._hashes = {rel: h for rel, h, _ in files}
         self._persist()
         if dense:
@@ -236,6 +281,10 @@ class Primolix:
         self._dense = self._dense or (self.dir / 'dense.npy').exists()
         self._bm = SparseBM25.load(str(self.dir / 'bm25.npz'))
         self._meta = [json.loads(l) for l in open(self.dir / 'meta.jsonl', encoding='utf-8')]
+        self._rows = None          # 失效行号缓存
+        # 建库分词档随索引落盘（`kernel.stream_mode`），重载后重建仍用它；
+        #    缺字段 = 旧版索引 → 按默认档。
+        self._stream = _norm_stream(getattr(self._bm, "stream_mode", "off"))
         hf = self.dir / 'hashes.json'
         self._hashes = json.load(open(hf, encoding='utf-8')) if hf.exists() else {}
         self._vecs = None
@@ -292,12 +341,24 @@ class Primolix:
 
     # ---------- 检索 ----------
 
+    def _active_rows(self):
+        r"""活跃 chunk 的物理行号数组 (缓存)。
+
+        只在 `_meta` 变化时变, 故缓存; 每个 `self._meta =` 赋值点都要把 `self._rows`
+        置 `None` (与 `_w_persist_key` 同一条纪律: 键不符还用 = 静默错分)。
+        """
+        if self._rows is None:
+            n = len(self._meta)
+            self._rows = (np.fromiter((c['row'] for c in self._meta), dtype=np.int64, count=n)
+                          if n else np.zeros(0, dtype=np.int64))
+        return self._rows
+
     def _score_active(self, qtoks):
         """返回与 self._meta 对齐的 BM25 分数数组（按每条 row 取物理行分）。"""
         scores = self._bm.score_all(qtoks)
-        if len(self._meta) == 0:
+        rows = self._active_rows()
+        if rows.size == 0:
             return np.zeros(0, dtype=np.float32)
-        rows = np.asarray([c['row'] for c in self._meta], dtype=np.int64)
         return scores[rows].astype(np.float32)
 
     def query(self, q, k=10, dense=False):
@@ -309,7 +370,7 @@ class Primolix:
             self._load()
         s = self._score_active(zh_tokenize(q))     # 与 self._meta 对齐
         if dense and self._vecs is not None:
-            cand = np.unique(np.argsort(-s)[:max(k * 10, 100)])
+            cand = np.unique(_topk_idx(s, max(k * 10, 100)))
             cand = cand[s[cand] > 0] if (s[cand] > 0).any() else cand
             model = get_dense_model(self._model_path)
             if model is not None:
@@ -320,11 +381,11 @@ class Primolix:
                 b = s / max(s.max(), 1e-9)
                 d = s_d / max(s_d.max(), 1e-9)
                 fused = 0.6 * d + 0.4 * b
-                order = np.argsort(-fused)[:k]
+                order = _topk_idx(fused, k)
             else:
-                order = np.argsort(-s)[:k]
+                order = _topk_idx(s, k)
         else:
-            order = np.argsort(-s)[:k]
+            order = _topk_idx(s, k)
         out = []
         for rank, i in enumerate(order, 1):
             if s[i] <= 0:
@@ -423,6 +484,7 @@ class Primolix:
         for c, row in zip(append_chunks, new_rows):
             c['row'] = int(row)
         self._meta = keep_meta + append_chunks
+        self._rows = None          # 失效行号缓存
         self._hashes = new
         self._persist()
         # dense: update 后整库重对齐 (rows 迁移, 旧向量错位; 小语料可负担)
@@ -450,10 +512,11 @@ class Primolix:
                     f"或显式 `rebuild(..., force=True)` 承认丢弃")
         z = Primolix.build(root, str(self.dir), dense=self._dense,
                         model_path=self._model_path, workers=workers,
-                        skip_dirs=[self.dir])
+                        skip_dirs=[self.dir], stream=getattr(self, "_stream", False))
         manifest_append(self.dir, {"event": "reset", "reason": "rebuild_in_place"})
         self._bm = z._bm
         self._meta = z._meta
+        self._rows = None          # 失效行号缓存
         self._hashes = z._hashes
         self._vecs = z._vecs
 

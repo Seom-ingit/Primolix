@@ -207,6 +207,43 @@ def _stream_scan(docs, tok, workers, on_doc):
         on_doc(i, tok(d))
 
 
+class _TripleBuf:
+    r"""建库三元组缓冲：预分配 numpy 数组, 取代 `rows/cols/data` 三个 list。
+
+    `list.append` 的元素是独立堆对象 (int>256 各占 28 B + 8 B 指针), posting 上亿时
+    三元组本身就是 GB 级常量, 且 `np.asarray` 转换瞬间两种表示并存。
+    写入顺序与 dtype 与旧的 `list -> np.asarray` 一致 (逐位相同);
+    有确切 `nnz` 时一次到位, 否则按 `_GROW` 增长。
+    """
+
+    _GROW = 1.25
+
+    def __init__(self, nnz_hint=None):
+        cap = int(nnz_hint) if nnz_hint else 1024
+        self.rows = np.empty(cap, dtype=np.int32)
+        self.cols = np.empty(cap, dtype=np.int32)
+        self.data = np.empty(cap, dtype=np.float32)
+        self.n = 0
+
+    def append(self, r, c, v):
+        if self.n >= self.rows.size:
+            cap = max(int(self.rows.size * self._GROW) + 1, self.n + 1)
+            for name in ("rows", "cols", "data"):
+                old = getattr(self, name)
+                new = np.empty(cap, dtype=old.dtype)
+                new[:self.n] = old
+                setattr(self, name, new)
+        self.rows[self.n] = r
+        self.cols[self.n] = c
+        self.data[self.n] = v
+        self.n += 1
+
+    def freeze(self):
+        """已用前缀 (视图, 不拷贝); `data` = tf 词频计数。"""
+        n = self.n
+        return self.rows[:n], self.cols[:n], self.data[:n]
+
+
 class PreallocCSR:
 
     def __init__(self, V, n_rows_cap, nnz_cap):
@@ -453,6 +490,9 @@ class SparseBM25:
         self.W = self.Wc = None  # 01d: 新索引不构建/不落盘权重矩阵 (导出物)
         self.df = None         # np.int32[V] 存活文档计数
         self._idf = None       # np.float32[V] 现算缓存 (df/N_live 驱动)
+        # 建库时的分词档, 随索引落盘 (`off`/`on`/`ids`), 供整库重建复用 ——
+        #    不落盘的话重载后由上层触发的重建会退回内存最高的默认档。
+        self.stream_mode = "ids" if stream == "ids" else ("on" if stream else "off")
         self._dead = None      # bool[N] 墓碑 (None=全活); append 时扩展
         # 视图 = BM25 权威层之上可丢可滞后可分版的派生层（覆盖位图 + 视图可用性）。
         # 删掉全部视图时查询逐位回 BM25-only；视图不持久化（save/load 都不写它），
@@ -471,9 +511,11 @@ class SparseBM25:
             #    目标：时间 ≈ 非流式（分词只做一遍）而内存 ≈ 流式
             #    （`41M token × 4 B = 165 MB` vs 缓存字符串 ≈ 2 GB）。
             doc_ids = []
+            nnz_hint = 0
             for _i, _d in enumerate(docs):
                 _toks = tok(_d)
                 self.dl[_i] = len(_toks)
+                nnz_hint += len(set(_toks))          # = 本趟 pass2 的 `_tf` 条目数, 精确
                 _arr = np.empty(len(_toks), dtype=np.int32)
                 for _j, _t in enumerate(_toks):
                     _c = term2idx.get(_t)
@@ -485,30 +527,34 @@ class SparseBM25:
                 doc_ids.append(_arr)
             V = len(idx2term)
             log(f"S1 词表完成(ids 模式) N={self.N} V={V} {time.time()-t0:.1f}s")
-            rows, cols, data = [], [], []
+            tri = _TripleBuf(nnz_hint)
             df = defaultdict(int)
             for _i, _arr in enumerate(doc_ids):      # 本趟不再分词
                 _tf = {}
                 for _c in _arr.tolist():
                     _tf[_c] = _tf.get(_c, 0) + 1
                 for _c, _n in _tf.items():
-                    rows.append(_i); cols.append(_c); data.append(_n); df[_c] += 1
+                    tri.append(_i, _c, _n); df[_c] += 1
             del doc_ids
         elif stream:
             # ===== 流式: 两遍各自分词, 不驻留 doc_toks (并行可选, 用满多核) =====
             log(f"S1 流式分词 (stream): 两遍扫描省内存, {self.N} 篇"
                 f"{f' ×{workers} 并行' if workers > 1 else ''}...")
 
+            _hint = [0]        # pass1 顺手数 nnz (免去 `_TripleBuf` 增长式的过分配)
+
             def _idx_doc(i, toks):
                 self.dl[i] = len(toks)
-                for t in set(toks):
+                _u = set(toks)
+                _hint[0] += len(_u)
+                for t in _u:
                     if t not in term2idx:
                         term2idx[t] = len(idx2term)
                         idx2term.append(t)
             _stream_scan(docs, tok, workers, _idx_doc)
             V = len(idx2term)
             log(f"S1 词表完成 N={self.N} V={V} {time.time()-t0:.1f}s")
-            rows, cols, data = [], [], []
+            tri = _TripleBuf(_hint[0])               # pass1 已数过词, nnz 精确
             df = defaultdict(int)
 
             def _tri_doc(i, toks):
@@ -516,9 +562,7 @@ class SparseBM25:
                 for t in toks:
                     tf[t] = tf.get(t, 0) + 1
                 for t, c in tf.items():
-                    rows.append(i)
-                    cols.append(term2idx[t])
-                    data.append(c)
+                    tri.append(i, term2idx[t], c)
                     df[t] += 1
             _stream_scan(docs, tok, workers, _tri_doc)
         else:
@@ -532,26 +576,27 @@ class SparseBM25:
                     doc_toks = [tok(d) for d in docs]
             else:
                 doc_toks = [tok(d) for d in docs]
-            # pass1: 词表（复用 doc_toks）
+            # pass1: 词表（复用 doc_toks）＋ 顺手取**精确 nnz**（`len(set(toks))` ＝ pass2 的 tf 条目数）
+            nnz_hint = 0
             for i, toks in enumerate(doc_toks):
                 self.dl[i] = len(toks)
-                for t in set(toks):
+                _uniq = set(toks)
+                nnz_hint += len(_uniq)
+                for t in _uniq:
                     if t not in term2idx:
                         term2idx[t] = len(idx2term)
                         idx2term.append(t)
             V = len(idx2term)
             log(f"S1 词表完成 N={self.N} V={V} {time.time()-t0:.1f}s")
             # pass2: 收集 tf 三元组（复用 doc_toks）
-            rows, cols, data = [], [], []
+            tri = _TripleBuf(nnz_hint)
             df = defaultdict(int)
             for i, toks in enumerate(doc_toks):
                 tf = {}
                 for t in toks:
                     tf[t] = tf.get(t, 0) + 1
                 for t, c in tf.items():
-                    rows.append(i)
-                    cols.append(term2idx[t])
-                    data.append(c)
+                    tri.append(i, term2idx[t], c)
                     df[t] += 1
             del doc_toks
         if vocab is not None and len(idx2term) != len(vocab):
@@ -561,16 +606,19 @@ class SparseBM25:
         self.term2idx = term2idx
         self.idx2term = idx2term
         t1 = time.time()
-        log(f"S1 三元组收集完成 {len(data)} 项 {t1-t0:.1f}s (nnz≈{len(data)//1000000}M)")
-        rows = np.asarray(rows, dtype=np.int32)
-        cols = np.asarray(cols, dtype=np.int32)
-        data = np.asarray(data, dtype=np.float32)   # 注意: data = tf (词频计数)
+        rows, cols, data = tri.freeze()             # 预分配缓冲的已用前缀（不拷贝, dtype 与旧 asarray 相同）
+        del tri
+        log(f"S1 三元组收集完成 {data.size} 项 {t1-t0:.1f}s (nnz≈{data.size//1000000}M)")
         self.avgdl = float(self.dl.sum()) / max(self.N, 1)
         # ---- INCR: 权威原语 (tf/df/dl), 供真增量 + 现算路径 ----
         self.df = (np.array([df.get(_c, 0) for _c in range(V)], dtype=np.int32) if _df_by_id
                    else np.array([df.get(t, 0) for t in idx2term], dtype=np.int32))
         self._idf = np.log((self.N - self.df + 0.5) / (self.df + 0.5) + 1).astype(np.float32)
+        del df          # 已折进 self.df, 及时释放 (V 级 dict)
         self.T = csr_matrix((data, (rows, cols)), shape=(self.N, V)).tocsr()
+        # `rows/cols/data` 是三元组缓冲的视图, `csr_matrix` 已拷走数据 → 及时释放;
+        #    否则它们会与 `_Tbuf`/CSC 同时驻留 (1M 段约 500 MB)。
+        del rows, cols, data
         # ---- 01e-A: 换容量预分配后端 (一次性 O(nnz) 拷贝, 计入建索引成本) ----
         self._Tbuf = PreallocCSR.from_csr(self.T, slack=self.T_SLACK)
         self.T = self._Tbuf.wrap()
@@ -1487,7 +1535,8 @@ class SparseBM25:
                 f"（重载会崩）→ 请先 `fold_all()` 把它们并进主表，或先 `unmount_segment(tag)`）")
         z = dict(vocab=np.asarray(self.idx2term, dtype=object),
                  dl=self.dl,  # dl 必须落盘, 否则 load 后 BM25 分数失真
-                 params=np.asarray([self.k1, self.b, self.avgdl], dtype=np.float32))
+                 params=np.asarray([self.k1, self.b, self.avgdl], dtype=np.float32),
+                 stream_mode=np.asarray([self.stream_mode]))
         if self.T is not None:
             z.update(fmt='primolix-bm25-v3',
                      W_shape=np.asarray(self.T.shape, dtype=np.int64),
@@ -1644,6 +1693,8 @@ class SparseBM25:
         bm._Tbuf = None            # 01e: 首次 append 时一次性换预分配后端
         bm._tc_blocks = []         # 01e-C: 分块 CSC (有 T 时在下面建块0)
         bm._tc_rows = 0
+        # 建库分词档: 缺字段 = 旧版索引, 按内存最高的默认档 `off` 处理。
+        bm.stream_mode = str(z['stream_mode'][0]) if 'stream_mode' in z else "off"
         if 'dl' in z and len(z['dl']) == n_rows:
             bm.dl = z['dl'].astype(np.float32)
             bm.avgdl = float(z['params'][2]) if 'params' in z else float(bm.dl.sum()) / max(n_rows, 1)
