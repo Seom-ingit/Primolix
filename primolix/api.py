@@ -170,7 +170,7 @@ class Index:
             return out
 
     def _diagnose(self, q: str, k: int = 10, s=None, qtoks=None) -> dict:
-        """（内部）为什么没搜到 / 为什么只搜到这些 —— 只输出有把握的判断。
+        """（内部）**为什么没搜到** / 为什么只搜到这些 —— 只输出有把握的判断。
 
         每条 `messages[*]` 都带 `evidence`（可点开验证的实数）与 `action`（人话动作），
         符合本层「不许静默、解释必须可举证」的约定。不猜：拿不到的数一律不编。
@@ -245,7 +245,7 @@ class Index:
                     status=status, messages=msgs)
 
     def diagnose(self, q: str, k: int = 10) -> dict:
-        """诊断：为什么没搜到 / 为什么只搜到这些 —— 产品侧入口（人话 + 可举证）。
+        """诊断：**为什么没搜到** / 为什么只搜到这些 —— 产品侧入口（人话 + 可举证）。
 
         与 `explain()` 分工：`explain` 拆「某一篇为什么得分高」，`diagnose` 看「整次查询的
         处境」（词在不在库里、沾边有多少、哪些词没区分度）。两者用同一份分数数组口径
@@ -328,7 +328,7 @@ class Index:
                         folded=self._z._bm.folded_report())
 
     def compact(self) -> dict:
-        """压实：把已挂段全部折进主表 ＋ 落盘 ＋ 清分块缓存 → 查询恢复单块。
+        """压实：把已挂段全部折进主表 ＋ **落盘** ＋ 清分块缓存 → 查询恢复单块。
 
         查询耗时随分块数上升，长期只追加会把块数堆起来；折叠是一次 `O(nnz)`，折完只走主表。
         内核不变量 `fold_segment` 断言"折完 T 行数 == N"（`N` 含所有已挂段）→ 多段时用不了
@@ -349,7 +349,7 @@ class Index:
                 bm._tc_blocks, bm._tc_rows = [], 0
                 bm._invalidate_w()
                 bm._recompute_stats()
-                self._z._persist()               # 先落盘（折叠改了 T 与 meta）
+                self._z._persist()               # ⭐ 先落盘（折叠改了 T 与 meta）
                 bm._ensure_tc()
                 # 折叠 = 一次提交：必须往旁车追加 `folded_all`，否则重载时旁车仍把已折的段当"在挂"。
                 manifest_append(self.dir, {"event": "folded_all", "tags": list(info["tags"]),
@@ -362,7 +362,7 @@ class Index:
             for tag in segs:
                 folded.append(dict(tag=tag, **bm.fold_segment(tag)))
             if folded:
-                self._z._persist()               # 先落盘（同上）
+                self._z._persist()               # ⭐ 先落盘（同上）
                 manifest_append(self.dir, {"event": "folded_all",
                                            "tags": [f["tag"] for f in folded],
                                            "via": "compact/fold_segment"})
@@ -426,7 +426,7 @@ class Index:
             z = self._z
             s = z._bm.fused_scores(zh_tokenize(q), qvec, view_name, alpha=alpha)
             rows = z._active_rows()
-            sv = s[rows]                              # 只取一次
+            sv = s[rows]                              # ⭐ 只取一次
             ranked = _topk_idx(sv, k)
             out = []
             for i, j in enumerate(ranked, 1):

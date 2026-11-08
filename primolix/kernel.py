@@ -1188,7 +1188,7 @@ class SparseBM25:
                        ms=(time.perf_counter() - t0) * 1e3)
             folded[_tag] = rec
             del self._segments[_tag]
-        self._folded = {getattr(self, "_folded", {}), folded}
+        self._folded = {**getattr(self, "_folded", {}), **folded}
         return dict(tags=list(folded), rows=int(len(rs)), ms=(time.perf_counter() - t0) * 1e3,
                     nnz_before=nnz_before, nnz_after=int(self.T.nnz),
                     N=int(self.N), V=int(self.V))
@@ -1348,7 +1348,7 @@ class SparseBM25:
         return np.arange(base, base + k)
 
     def _append_docs_vec(self, toks_list, k, base):
-        r"""`WRITE_VEC=True` 的批量向量化写路径（与 `append_docs` 逐位等价）。
+        r"""`WRITE_VEC=True` 的批量向量化写路径（与 `append_docs` **逐位等价**）。
 
         等价性论证（三条都必须成立，否则逐位必挂）：
         ① 一行一词一条：legacy 用 `defaultdict` 计数 ⇒ 唯一；这里对 `doc*V + col`

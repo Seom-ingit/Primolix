@@ -69,6 +69,7 @@ Keys inside `bm25.npz` (measured):
 | `params` | float32 x3 | `k1` / `b` / `avgdl` |
 | `vocab` | object x V | vocabulary (term -> column) |
 | `W_shape` | int64 x2 | compatibility (only old v1/v2 stored the `W` score matrix) |
+| `stream_mode` | string array x1 | build-time tokenisation mode (`off` / `on` / `ids`, since 0.1.x). **A missing key means `off`**, so old indexes still load; it makes the "out-of-vocabulary rebuild" reuse the same build mode -- it changes build peak memory only, never a score |
 
 In one line: **`bm25.npz` holds invertible primitives; everything else is a materialisation or a
 manifest that can be rebuilt from it.**
@@ -100,7 +101,10 @@ manifest that can be rebuilt from it.**
 
 ## 4. Versions and compatibility
 
-- The version lives in the `fmt` key of `bm25.npz`: `primolix-bm25-v3` (current).
+- The version lives in the `fmt` key of `bm25.npz`: `primolix-bm25-v3` (current). **0.2.0 does not change
+  this string**: the new approximate top-k, `diagnose()`, `span` and `WRITE_VEC` all live on the query path
+  or the write path, the on-disk format is byte-identical, so going from 0.1.x to 0.2.0 does **not** need
+  a rebuild.
 - **Indexes written before the rename (`fmt = zelix-bm25-v3`) still load**: the reader normalises the
   old format string to the new name (the on-disk format did not change, only the package/class name),
   so **upgrading does not require rebuilding**.

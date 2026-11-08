@@ -28,6 +28,11 @@ scores**. So it is the mirror image of "precompute the weighted scores and store
   can be open at once.
 - **You need to explain "why did this rank first"**: a score decomposes per term into
   `idf x saturation(tf) x document length`.
+- **You need to explain "why did nothing match"** (0.2.0): `diagnose()` reports the situation
+  (`all_oov` / `no_positive` / `partial_oov`), per-term evidence and plain-language messages; a term
+  outside the vocabulary is no longer dropped silently but shows up in `explain()`. Empty result sets are
+  common in zero-encoding Chinese setups (tokenisation caliber and a closed vocabulary both cause them),
+  and this distinction matters more than 0.1 ms.
 - **You need to audit / reconcile**: checking the primitives (`df`/`dl`/tombstones) confirms a change,
   at a cost proportional to the change.
 - **You need rollback / multiple versions**: a view is "segment list + tombstones + parameters +
@@ -48,7 +53,9 @@ scores**. So it is the mirror image of "precompute the weighted scores and store
   least favourable case -- with `W_CACHE` on, the materialised layer overtakes it (**1.16 ms vs
   1.39 ms**, same batch).
 - **Single-query latency is a hard budget** (e.g. a tight P99): every query recomputes, so it is slower
-  than reading stored numbers.
+  than reading stored numbers. 0.2.0 replaces "sort all N" in the selection stage with a sampled
+  threshold (1M, `k=10`: 5.92 -> 2.81 ms end to end), but that step is **probabilistic**: for fully
+  deterministic behaviour set `primolix.core.TOPK_APPROX = False` and pay the old selection cost.
 - **Multimodal** (image / audio / video): this package handles text tokens only.
 - **Distributed / multi-machine sharding, out of the box**: this package is single-machine,
   single-index — no shard routing, no coordination layer. That is **"not implemented", not a mechanism

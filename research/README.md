@@ -38,6 +38,18 @@
 
 3. **注意台子会写临时产物**（`.dbg/`、`.dbg_guard/`、`_tmp_*.npz` 等）。这些都已进 `.gitignore`。
 
+## 本版（0.2.0）新增数字的出处
+
+| 数字 | 台子（未随包提供） | 读数形状 |
+|---|---|---|
+| 选择段 `4.93 → 0.57 ms`（1M）· `k∈{10,100,1000}` × `frac∈{16,32}` 的等价性 | `_probe_topk_equiv.py` | 200 查询、分数多重集违规 0、候选覆盖率 |
+| 端到端 `5.92 → 2.81 ms`（`k=10`）· `6.03 → 2.75 ms`（`k=100`） | `_probe_e2e_topk.py` | 真实 `Primolix.query`、交错 A/B 4 轮、200 查询，附 `topk_stats()` 两臂自证 |
+| 全量质量 `R@10 0.4467` / `MRR@10 0.2794`（两臂逐位相同） | `_probe_mrr_topk.py` | 6,980 查询、分数违规 0、文档序列差异 73 条（gold 相关 0 条） |
+| 写单价 `0.34–0.64 µs/posting` · 一次性建表 `≈31 ms@V=63,314` | `_probe_writecost2.py` + 臂扫描 | 20 个成本臂，每臂带 W0/W2a/W2b/W2c 自检 |
+
+三条口径纪律沿用本目录的既有做法：**同批对照**才可比；**两臂都要自证真的动过**（`topk_stats()` 的
+`approx` / `exact` 计数）；**质量面与成本面分开报**，不拿其中一面推另一面。
+
 ## 源工作区里已知的不可直接运行项（如实列出）
 
 - `latency_ab.py` 里有两路**上一代内核的对照臂**（标签 `zelix_*`）—— 那需要旧内核与旧索引，
@@ -56,3 +68,5 @@ paths to private corpora, and 37 need real corpus/query files. If you have the p
 of the same shape (one object per line: `{"text": ...}` for documents, `{"q": ...}` for queries) and they
 will run against your data. The reusable part is the measurement discipline (three time points,
 two memory calibers, interleaved A/B, frozen query-set fingerprints, memory guard rails).
+The 0.2.0 numbers (selection stage, end-to-end latency, full-set quality, write unit price) are mapped to
+their probes in the table above; each row also states the caliber it was read under.

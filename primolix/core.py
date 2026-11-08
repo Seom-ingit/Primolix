@@ -220,20 +220,20 @@ def _topk_exact(x, k):
     if buf is None or buf.size < n or buf.dtype != x.dtype:
         buf = np.empty(n, dtype=x.dtype)
         _NEG_BUF.arr = buf
-    neg = np.negative(x, out=buf[:n])                     # 复用 ⇒ 无 N 长临时
+    neg = np.negative(x, out=buf[:n])                     # ⭐ 复用 ⇒ 无 N 长临时
     idx = np.argpartition(neg, k - 1)[:k].astype(np.int64, copy=False)
     return idx[np.lexsort((idx, -x[idx]))]
 
 
 def _topk_sample(x, n, k, st):
-    """P-O3 近似路径：1/`TOPK_FRAC` 采样定阈 → `flatnonzero` → 只对候选选 k。
+    """⭐ P-O3 近似路径：1/`TOPK_FRAC` 采样定阈 → `flatnonzero` → 只对候选选 k。
 
     返回 `None` 表示"本形态不适合近似"（交回精确路径，退化有界）：
       · 非浮点 / 非正分布（全零、全负）—— `_topk_idx` 的通用契约；
       · 正分文档数 < k（命中文档极少的查询）。
     这是概率性保证：阈值 = 采样第 k 大 × `TOPK_SHRINK`，理论上可能高于真第 k 大
-      ⇒ 漏掉边界文档。经验面（1M · 200 查询 · k∈{10,100,1000} · frac∈{16,32}）：
-      分数多重集 0 违规、候选覆盖 100%。
+       ⇒ 漏掉边界文档。经验面（1M · 200 查询 ·
+       k∈{10,100,1000} · frac∈{16,32}：分数多重集 0 违规、候选覆盖 100%）。
     """
     if x.dtype.kind != "f":
         return None
@@ -312,7 +312,7 @@ class Primolix:
         self._bm = None
         self._meta = None
         self._rows = None          # 活跃 chunk 的物理行号缓存 (每个 `self._meta =` 点置 None)
-        self._rows_ident = None    # 01m：`(rows 对象, 是否恒等)` —— 见 `_active_rows`
+        self._rows_ident = None    # ⭐ 01m：`(rows 对象, 是否恒等)` —— 见 `_active_rows`
         self._hashes = None
         self._vecs = None
         self._dense = dense
@@ -430,7 +430,7 @@ class Primolix:
             if rb < 0 or not docs:
                 skipped += len(docs)
                 _say(f"[staged] 段 {tag} 没有文档身份侧车（{SEG_DOCS}）"
-                     f"→ 该段 {info.get('rows', '?')} 行在产品层不可见（如实降级，不猜身份）")
+                     f"→ 该段 {info.get('rows', '?')} 行在产品层**不可见**（如实降级，不猜身份）")
                 continue
             for i, d in enumerate(docs):
                 row = rb + i
@@ -444,10 +444,10 @@ class Primolix:
                 have.add(row)
                 added += 1
         if added:
-            self._rows = None            # 失效行号缓存（新数组对象 ⇒ 恒等判定自动作废）
+            self._rows = None            # ⭐ 失效行号缓存（新数组对象 ⇒ 恒等判定自动作废）
             if self._vecs is not None and len(self._vecs) != len(self._meta):
                 self._vecs = None
-                _say("[警告] 段内文档已并入 `_meta`，但 dense 向量数不匹配 → 本次忽略 dense"
+                _say("[警告] 段内文档已并入 `_meta`，但 dense 向量数不匹配 → 本次**忽略 dense**"
                      "（重编码后可恢复）")
         return dict(added=added, skipped=skipped)
 
@@ -649,7 +649,7 @@ class Primolix:
         for c, row in zip(append_chunks, new_rows):
             c['row'] = int(row)
         self._meta = keep_meta + append_chunks
-        self._rows = None          # 失效行号缓存（行号已迁移/追加）
+        self._rows = None          # ⭐ 失效行号缓存（行号已迁移/追加）
         self._hashes = new
         self._persist()
         # dense: update 后整库重对齐 (rows 迁移, 旧向量错位; 小语料可负担)
@@ -681,7 +681,7 @@ class Primolix:
         manifest_append(self.dir, {"event": "reset", "reason": "rebuild_in_place"})
         self._bm = z._bm
         self._meta = z._meta
-        self._rows = None          # 失效行号缓存
+        self._rows = None          # ⭐ 失效行号缓存
         self._hashes = z._hashes
         self._vecs = z._vecs
 
@@ -853,7 +853,7 @@ def load_seg_docs(index_dir, tag) -> list:
             try:
                 out.append(json.loads(ln))
             except ValueError:
-                break                     # 半行（写崩）⇒ 只认前缀，不猜
+                break                     # 半行（写崩）⇒ 只认前缀，⛔ 不猜
     return out
 
 

@@ -163,11 +163,13 @@ check("8 removed file gone (and the delete took the incremental path)",
       f"update() -> kind={rep8.get('kind')!r}; listed={len(listed)}; cooking hits={len(hits8)}")
 
 # ---------------------------------------------------------------- 9 reload determinism
-q = "sparse index"
+# NOTE: the query must still hit something after checks 6-8 (a.txt rewritten, b.txt deleted,
+# d.txt added) -- "sparse index" matched nothing and made this check vacuous (0 hits compared).
+q = "kernel kernel"
 h1 = [(h["file"], round(h["score"], 6)) for h in z.query(q, k=3)]
 z2 = Primolix(str(idx))
 h2 = [(h["file"], round(h["score"], 6)) for h in z2.query(q, k=3)]
-check("9 reload is deterministic", h1 == h2, f"{len(h1)} hits compared")
+check("9 reload is deterministic", bool(h1) and h1 == h2, f"{len(h1)} hits compared")
 
 # ---------------------------------------------------------------- 10 facade: diagnose / explain(diagnose=True)
 # The product-side question is "why is it empty", not "why is this one on top". `diagnose()` answers the

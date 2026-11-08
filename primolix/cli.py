@@ -341,9 +341,9 @@ def _fmt_diag(d):
             print(f"    {t['term']:<16} 库里 {t['df']:>6d} 篇（占比 {t['df_ratio']:.1%}）"
                   f"  idf={t['idf']:.3f}")
         else:
-            print(f"    {t['term']:<16} 不在词表")
+            print(f"    {t['term']:<16} ⛔ 不在词表")
     for m in d["messages"]:
-        mark = {"warn": "", "info": "ℹ"}.get(m["level"], "·")
+        mark = {"warn": "⚠", "info": "ℹ"}.get(m["level"], "·")
         print(f"  {mark} {m['what']}")
         if m.get("action"):
             print(f"     → {m['action']}")
@@ -375,7 +375,7 @@ def _cmd_explain(args):
     print(f"查询 {args.q!r} 的逐词贡献（{len(rows)} 项 · 合计 {total:.4f}）：")
     for r in rows:
         if r["status"] == "oov":
-            print(f"  {r['term']:<14} 不在词表（这个词你的库里没有，贡献 0）")
+            print(f"  {r['term']:<14} ⛔ 不在词表（这个词你的库里没有，贡献 0）")
         elif r["status"] == "no_tf":
             print(f"  {r['term']:<14} 这篇里没有这个词（贡献 0，但不是它拉低了你）")
         elif r["status"] == "unavailable":
