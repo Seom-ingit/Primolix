@@ -22,7 +22,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from . import kernel
-from .core import Primolix, get_dense_model, _topk_idx
+from .core import Primolix, get_dense_model, publish_segment, _topk_idx
 from .kernel import RWLock, SparseBM25, zh_tokenize     # RWLock 复用内核的可重入实现
 
 __all__ = ["RWLock", "Index", "open_index", "build_index", "set_switches"]
@@ -256,16 +256,13 @@ class Index:
 
     # ---------------------------------------------------------------- 写
     def add(self, root: str, *, workers: int = 0) -> dict:
-        """增量：只处理改动过的文件；出现词表外新词 → 整库回退重建（`kind='rebuild'`）。
+        """增量：只处理改动过的文件，走 `Primolix.update()` 的路由（见 `04c` 判据件）。
 
-        已挂段时就地更新会被拒（段的逻辑行会与就地追加的行重叠 → 静默错分）→ 先 `compact()`
-        折叠，或改走 `stage_begin()`；纯删除不受限。
+        四个出口（`kind`）：`noop` / `incremental` / `staged` / `rebuild`。
+        段在场时：含新词 → 还能再挂一段（`staged`）；词表内 → 路由直接拒绝并提示
+        `compact()`（就地追加会与段的逻辑行重叠 → 静默错分）。
         """
         with self._lock.write():
-            if self._z._bm.segment_report():
-                raise RuntimeError(
-                    f"已挂段 {sorted(self._z._bm.segment_report())} → 先 `compact()`（折叠进主表）"
-                    f"再走就地更新，或改用 `stage_begin()` 走挂段路径")
             return self._z.update(root, workers=workers)
 
     def rebuild(self, root: str, *, workers: int = 0, force: bool = False) -> dict:
@@ -340,37 +337,10 @@ class Index:
         重载时 `remount_staged` 会因 `T.shape[0] > row_base` 判为已折叠而跳过 ⇒ 安全。
         """
         with self._lock.write():
-            from .core import manifest_append
-            bm = self._z._bm
-            segs = list(bm.segment_report())
-            if len(segs) > 1:
-                # 多段时走内核的 `fold_all()`（`fold_segment` 的不变量在多段下不成立）
-                info = bm.fold_all()
-                bm._tc_blocks, bm._tc_rows = [], 0
-                bm._invalidate_w()
-                bm._recompute_stats()
-                self._z._persist()               # ⭐ 先落盘（折叠改了 T 与 meta）
-                bm._ensure_tc()
-                # 折叠 = 一次提交：必须往旁车追加 `folded_all`，否则重载时旁车仍把已折的段当"在挂"。
-                manifest_append(self.dir, {"event": "folded_all", "tags": list(info["tags"]),
-                                           "via": "compact/fold_all"})
-                return dict(folded=[dict(tag=t, **{k: v for k, v in info.items()
-                                                   if k not in ("tags",)}) for t in info["tags"]],
-                            blocks=len(bm._tc_blocks), N=int(bm.N), V=int(bm.V),
-                            via="fold_all", ms=info.get("ms"))
-            folded = []
-            for tag in segs:
-                folded.append(dict(tag=tag, **bm.fold_segment(tag)))
-            if folded:
-                self._z._persist()               # ⭐ 先落盘（同上）
-                manifest_append(self.dir, {"event": "folded_all",
-                                           "tags": [f["tag"] for f in folded],
-                                           "via": "compact/fold_segment"})
-            bm._tc_blocks, bm._tc_rows = [], 0
-            bm._invalidate_w()
-            bm._recompute_stats()
-            bm._ensure_tc()                       # 立刻按新 T 建回单块（否则下一次查询才建）
-            return dict(folded=folded, blocks=len(bm._tc_blocks), N=int(bm.N), V=int(bm.V))
+            out = self._z.compact_segments()      # 与 update() 的 `fold_first` 出口共用
+            return dict(folded=out["folded"], blocks=out["blocks"], N=out["N"],
+                        V=out["V"], ms=out["ms"], via=out["via"],
+                        tags=out["tags"])
 
     # ---------------------------------------------------------------- 临时段发布
     def stage_begin(self, tag: str | None = None, *, generation: str | None = None) -> "Stage":
@@ -582,59 +552,13 @@ class Stage:
         """
         if not self._rows:
             raise RuntimeError("空批次：没有任何文档可发布（先 `add()`）")
-        from .core import SEG_DOCS, SEG_SUBDIR, manifest_append
-        idx, bm = self.idx, self.bm
+        idx = self.idx
         with idx._lock.write():
-            if len(bm.idx2term) != self.base_V:
-                raise RuntimeError(f"基世代已变（base_V={self.base_V} → {len(bm.idx2term)}）"
-                                   f" → 这批必须重新分段（不静默重映射）")
-            if int(bm.T.shape[0]) != self.base_T_rows:
-                raise RuntimeError(f"主表行数已变（{self.base_T_rows} → {int(bm.T.shape[0])}）"
-                                   f" → 有人就地追加过；先 `compact()` 再重来")
-            V0, M = self.base_V, len(self._new_terms)
-            seg_dir = Path(idx.dir) / SEG_SUBDIR / str(self.tag)
-            seg_dir.mkdir(parents=True, exist_ok=True)
-            ri, ci, da = [], [], []
-            for i, (_docid, toks, _f, _l, _x) in enumerate(self._rows):
-                for t, c in Counter(toks).items():
-                    col = self._t2i.get(t) if self._t2i is not None else bm.term2idx.get(t)
-                    if col is None:
-                        col = self._new_pos[t]
-                    ri.append(i)
-                    ci.append(col)
-                    da.append(float(c))
-            csc = sp.csc_matrix((np.asarray(da, np.float32),
-                                 (np.asarray(ri, np.int32), np.asarray(ci, np.int32))),
-                                shape=(len(self._rows), V0 + M))
-            np.save(seg_dir / f"{self.tag}.data.npy", np.asarray(csc.data, np.float32))
-            np.save(seg_dir / f"{self.tag}.idx.npy", np.asarray(csc.indices, np.int32))
-            np.save(seg_dir / f"{self.tag}.ptr.npy", np.asarray(csc.indptr, np.int32))
-            dl = np.asarray([len(t) for _, t, _f, _l, _x in self._rows], np.float32)
-            np.save(seg_dir / "dl.npy", dl)
-            # 乙档：文档身份侧车先写好（沿用「段文件 → 侧车 → manifest 提交 → 挂段」）
-            row_base = int(bm.N)
-            with open(seg_dir / SEG_DOCS, "w", encoding="utf-8", newline="\n") as _fh:
-                for i, (_docid, _t, _f, _l, _x) in enumerate(self._rows):
-                    _d = str(_docid)
-                    _fh.write(json.dumps(dict(docid=_d, row=row_base + i,
-                                              file=(_f or _d), line=int(_l or 1),
-                                              text=_x), ensure_ascii=False) + "\n")
-            rec = dict(event="publish", tag=self.tag, generation=self.generation,
-                       rows=len(self._rows), row_base=row_base, base_V=V0, m_new=M,
-                       new_terms=list(self._new_terms), created=time.time(),
-                       seg_dir=f"{SEG_SUBDIR}/{self.tag}", docs=SEG_DOCS)
-            manifest_append(idx.dir, rec)            # 提交点（append-only）
-            info = bm.mount_segment(str(seg_dir), str(self.tag), list(self._new_terms), dl,
-                                    rows=len(self._rows), generation=self.generation)
-            # 乙档：立刻把段内文档补进产品层 `_meta`（否则本进程内 `search` 看不到它们）
-            absorbed = idx._z._absorb_staged([dict(tag=str(self.tag), mounted=True)])
-            folded = None
-            if fold:
-                folded = bm.fold_segment(str(self.tag))
-                idx._z._persist()                    # 折叠必须落盘才算持久（O(总 nnz)）
-                manifest_append(idx.dir, {"event": "folded_all", "tag": self.tag})
+            out = publish_segment(idx._z, list(self._rows), tag=self.tag,
+                                  generation=self.generation,
+                                  base_V=self.base_V, base_T_rows=self.base_T_rows,
+                                  new_terms=list(self._new_terms),
+                                  new_pos=self._new_pos, t2i=self._t2i, fold=fold)
             idx._stages.discard(self)
             self._rows, self._new_terms, self._new_pos = [], [], {}
-            return dict(tag=self.tag, rows=rec["rows"], V0=V0, V1=V0 + M,
-                        N=int(bm.N), V=int(bm.V), mounted=info, folded=folded,
-                        meta_added=int(absorbed.get("added", 0)))
+            return out

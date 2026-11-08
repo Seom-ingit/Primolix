@@ -7,7 +7,7 @@ Run:  python tests/test_staged_publish.py
 Checks (each prints PASS/FAIL; process exits 1 if anything fails):
   T1 a staged publish equals a full rebuild (bit-exact)
   T2 a reload auto-remounts published segments (bit-exact)
-  T3 an in-place append is refused while a segment is mounted (a pure delete still works)
+  T3 an in-place append under a segment folds first, then increments (a pure delete still works)
   T4 two batches, each adding new terms, both remount after a reload (bit-exact)
   T5 save(fold_first=True) folds and persists; a reload is bit-exact with no segments left
   T6 an unavailable segment is reported honestly on remount (never silently skipped)
@@ -94,21 +94,25 @@ check("T2 reload auto-remounts the published segment (bit-exact)",
       f"mounted={sorted(idx2.bm.segment_report())} N={int(idx2.bm.N)} V={int(idx2.bm.V)}"
       f" · max|d|={d2:.3e}")
 
-# ---------------------------------------------------------------- T3 in-place append refused
+# ---------------------------------------------------------------- T3 in-place append under a segment
+# 0.2.1（04c A）：段在场时不再抛"先 compact()"，而是**当场折回主表再增量**，并把折叠结果
+# 如实报在 `folded_tags` 里。纯删除在**内核层**仍可直接做（只动 df/dead，不长行）。
 (ROOT / "d_new.txt").write_text(long_("alpha beta"), encoding="utf-8")
-_guard = ""
+_rep3 = {}
 try:
-    idx2.add(str(ROOT))
+    _rep3 = idx2.add(str(ROOT))
 except RuntimeError as _e:
-    _guard = str(_e)[:60]
+    _rep3 = {"kind": f"RuntimeError: {str(_e)[:60]}"}
 (ROOT / "d_new.txt").unlink()
 _del_ok = True
 try:
     idx2.bm._tombstone_rows([0])                      # pure delete: only df/dead, no row growth
 except Exception:                                     # noqa: BLE001
     _del_ok = False
-check("T3 in-place append refused while a segment is mounted (pure delete still allowed)",
-      bool(_guard) and _del_ok, f"append -> {_guard!r} · pure delete ok={_del_ok}")
+check("T3 in-place append under a segment folds first, then increments (pure delete still allowed)",
+      _rep3.get("kind") == "incremental" and int(_rep3.get("folded_tags") or 0) >= 1 and _del_ok,
+      f"add -> kind={_rep3.get('kind')!r} folded={_rep3.get('folded_tags')!r}"
+      f" · pure delete ok={_del_ok}")
 
 # ---------------------------------------------------------------- T4 two batches both remount
 idx3 = primolix.open(str(IDX))
@@ -123,8 +127,8 @@ idx4 = primolix.open(str(IDX))
 after4 = np.stack(scores(idx4.bm))
 d4 = float(np.abs(after4 - before4).max()) if after4.shape == before4.shape else float("nan")
 check("T4 two batches (each with new terms) both remount after a reload (bit-exact)",
-      len(idx4.bm.segment_report()) == 3 and d4 == 0.0,
-      f"mounted={sorted(idx4.bm.segment_report())} (expect 3) · max|d|={d4:.3e}")
+      len(idx4.bm.segment_report()) == 2 and d4 == 0.0,
+      f"mounted={sorted(idx4.bm.segment_report())} (expect 2: b1 已被 T3 折进主表) · max|d|={d4:.3e}")
 
 # ---------------------------------------------------------------- T5 save(fold_first=True)
 # 根因：`load` 优先使用词表载体 `bm25.npz.vocab/`，而 `save()` 写载体是允许失败的 → 盘上可能残留

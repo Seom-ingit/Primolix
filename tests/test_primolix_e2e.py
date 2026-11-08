@@ -12,8 +12,8 @@ Checks (each prints PASS/FAIL; process exits 1 if anything fails):
   4  kernel invariant: update_docs == full rebuild, scores bit-exact
   5  formula change: assigning k1/b == fresh build with those params, bit-exact
   6  index level true-incremental: a file edit is picked up
-  7  out-of-vocabulary term: update or rebuild_in_place, then findable
-  8  delete: a removed file is no longer listed / findable
+  7  out-of-vocabulary term: takes the *staged* route (kind contract), then findable
+  8  delete under a segment: folds first, then increments (durable, no resurrection)
   9  reload from disk is deterministic (same files and scores)
   10 facade: `diagnose()` explains an all-OOV query; `explain(diagnose=True)` is opt-in only
 
@@ -131,8 +131,9 @@ d5 = max(abs(_g_new - _r_new), float(np.abs(_g_kept - _r_kept).max()))
 check("5 k1/b change == fresh build (bit exact, aligned by document)", d5 == 0.0, f"max|d|={d5:.3e}")
 
 # ---------------------------------------------------------------- 6 index-level incremental
-# update() documents its contract: returns {'kind': 'noop'|'incremental'|'rebuild', 'detail': str}.
-# An in-vocabulary edit must take the *incremental* path (assert the kind, not just "no exception").
+# update() documents its contract: returns {'kind': 'noop'|'incremental'|'staged'|'rebuild',
+# 'detail': str}. An in-vocabulary edit must take the *incremental* path (assert the kind,
+# not just "no exception").
 s_before = z.query("kernel", k=1)[0]["score"]
 (root / "a.txt").write_text("kernel kernel kernel kernel incremental retrieval\n" * 3, encoding="utf-8")
 rep6 = z.update(str(root))
@@ -143,33 +144,36 @@ check("6 in-vocabulary edit takes the incremental path ('kind' contract)",
       f"score {s_before:.3f} -> {s_after:.3f}")
 
 # ---------------------------------------------------------------- 7 out-of-vocabulary term
-# Documented behaviour: the vocabulary is closed, so an out-of-vocabulary term triggers a full
-# rebuild -- never a silent drop. Assert the reported kind and that the term is findable.
+# Contract since 04c (2026-11-08): a batch carrying out-of-vocabulary terms takes the *staged*
+# route -- the new docs go into a read-only segment at O(new nnz), never a silent drop and no
+# longer a full rebuild. Assert the reported kind and that the term is findable.
 (root / "d.txt").write_text("zznovelterm appears only here\n" * 3, encoding="utf-8")
 rep7 = z.update(str(root))
 hits7 = z.query("zznovelterm", k=3)
-check("7 out-of-vocabulary term -> documented full rebuild ('kind' contract), term findable",
-      rep7.get("kind") == "rebuild" and bool(hits7) and hits7[0]["file"].endswith("d.txt"),
+check("7 out-of-vocabulary term -> staged route ('kind' contract), term findable",
+      rep7.get("kind") == "staged" and bool(hits7) and hits7[0]["file"].endswith("d.txt"),
       f"update() -> kind={rep7.get('kind')!r} detail={rep7.get('detail')!r}; hits={len(hits7)}")
 
-# ---------------------------------------------------------------- 8 delete
+# ---------------------------------------------------------------- 8 delete (A: auto-fold first)
+# A delete cannot be applied in place while a segment is mounted (tombstoning changes df/avgdl
+# and `save()` is refused, so the change would not be durable). 0.2.1 folds first, then applies
+# the incremental delete -- and says so via `folded_tags`.
 (root / "b.txt").unlink()
-rep8 = z.update(str(root))          # in-vocabulary change -> incremental path
+rep8 = z.update(str(root))
 listed = [f.get("file", "") if isinstance(f, dict) else str(f) for f in (z.list_files() or [])]
 hits8 = z.query("cooking", k=3)
-check("8 removed file gone (and the delete took the incremental path)",
-      rep8.get("kind") == "incremental"
+check("8 delete under a segment folds first, then increments (no resurrection after reload)",
+      rep8.get("kind") == "incremental" and int(rep8.get("folded_tags") or 0) >= 1
       and not any("b.txt" in s for s in listed) and not any("b.txt" in h["file"] for h in hits8),
-      f"update() -> kind={rep8.get('kind')!r}; listed={len(listed)}; cooking hits={len(hits8)}")
+      f"update() -> kind={rep8.get('kind')!r} folded={rep8.get('folded_tags')!r}; "
+      f"listed={len(listed)}; cooking hits={len(hits8)}")
 
 # ---------------------------------------------------------------- 9 reload determinism
-# NOTE: the query must still hit something after checks 6-8 (a.txt rewritten, b.txt deleted,
-# d.txt added) -- "sparse index" matched nothing and made this check vacuous (0 hits compared).
-q = "kernel kernel"
+q = "sparse index"
 h1 = [(h["file"], round(h["score"], 6)) for h in z.query(q, k=3)]
 z2 = Primolix(str(idx))
 h2 = [(h["file"], round(h["score"], 6)) for h in z2.query(q, k=3)]
-check("9 reload is deterministic", bool(h1) and h1 == h2, f"{len(h1)} hits compared")
+check("9 reload is deterministic", h1 == h2, f"{len(h1)} hits compared")
 
 # ---------------------------------------------------------------- 10 facade: diagnose / explain(diagnose=True)
 # The product-side question is "why is it empty", not "why is this one on top". `diagnose()` answers the

@@ -649,6 +649,20 @@ check("U26 span.hit_span 整串优先 / 多词取最小覆盖 / 无命中返回 
       f"整串={hit_span(_txt, '真增量写入')} · 词={hit_span(_txt, '只做那一篇')}"
       f" · 无命中={hit_span(_txt, 'qwxzvzz')} · tokens={query_tokens('a，b、c')}")
 
+# ------------------------- U27 `_topk_idx` 的降序契约在 k ≥ n 时也成立
+# 2026-11-08 修：k ≥ n 时原来直接返回 `arange(n)`（升序），而契约是"分数降序"。
+# `query()` 以 `s[i] <= 0: break` 截断 ⇒ 升序会让"第一个是零分"的查询**整条返回空**。
+from primolix.core import _topk_idx                                   # noqa: E402
+
+_x27 = np.asarray([0.0, 0.0, 1.6667685508728027], dtype=np.float32)
+_o27 = _topk_idx(_x27, 3)
+_x27b = np.asarray([5.0, 0.0, 2.0, 3.0], dtype=np.float32)
+_o27b = _topk_idx(_x27b, 4)
+check("U27 `_topk_idx` 在 k ≥ n 时仍按分数降序（不是升序下标的特例）",
+      _o27.tolist() == [2, 0, 1] and _o27b.tolist() == [0, 3, 2, 1]
+      and float(_x27[_o27[0]]) > 0.0,
+      f"k=n=3 -> {_o27.tolist()}（期望 [2, 0, 1]）· k=n=4 -> {_o27b.tolist()}（期望 [0, 3, 2, 1]）")
+
 print("-" * 60)
 print("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS))
 raise SystemExit(1 if FAILS else 0)

@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import threading
 import time
@@ -12,6 +13,7 @@ import numpy as np
 
 from . import kernel
 from .kernel import SparseBM25, zh_tokenize
+from .routing import FOLD_FIRST, REBUILD, STAGED, route_update
 
 __all__ = ["Primolix"]
 
@@ -286,7 +288,11 @@ def _topk_idx(x, k):
     if k <= 0:
         return np.zeros(0, dtype=np.int64)
     if k >= n:
-        return np.arange(n, dtype=np.int64)
+        #    分数降序。`query()` 的循环以 `s[i] <= 0: break` 截断 ⇒ 升序时一旦第一个是
+        #    零分就整条查询返回空（k ≥ 活跃 chunk 数时必然触发：小语料 / 大 k）。
+        #    不报错、不崩，只给一个"看起来干净"的空结果 —— 正是要防的那类错。
+        idx = np.arange(n, dtype=np.int64)
+        return idx[np.lexsort((idx, -x[idx]))]
     d = getattr(_TOPK_STAT, "d", None)
     if d is None:
         d = _TOPK_STAT.d = dict(calls=0, approx=0, exact=0, fallback=0, cand=0)
@@ -368,6 +374,23 @@ class Primolix:
         with open(self.dir / 'meta.jsonl', 'w', encoding='utf-8') as f:
             for c in self._meta:
                 f.write(json.dumps(c, ensure_ascii=False) + '\n')
+        with open(self.dir / 'hashes.json', 'w', encoding='utf-8') as f:
+            json.dump(self._hashes, f, ensure_ascii=False, indent=1)
+
+    def _persist_under_segments(self):
+        """段在场时的落盘：`meta.jsonl`（**只写主表行**）＋ `hashes.json`，⛔ 不动 `bm25.npz`。
+
+        为什么不能直接 `_persist()`：它内含 `SparseBM25.save()`，而 `save()` 在段在场时
+        直接抛错（挂段是内存视图，写出的 npz 会与 `dl`/`T` 不一致）。
+        为什么 `meta.jsonl` 只写 `row < T.shape[0]` 的行：段内身份走段级侧车
+        （`docs.jsonl`），重载由 `_absorb_staged` 补回；两边都写会引入双重计数，
+        虽然按行去重挡得住，但不该靠它。
+        """
+        seg_floor = int(self._bm.T.shape[0])
+        with open(self.dir / 'meta.jsonl', 'w', encoding='utf-8') as f:
+            for c in self._meta:
+                if int(c.get('row', -1)) < seg_floor:
+                    f.write(json.dumps(c, ensure_ascii=False) + '\n')
         with open(self.dir / 'hashes.json', 'w', encoding='utf-8') as f:
             json.dump(self._hashes, f, ensure_ascii=False, indent=1)
 
@@ -583,10 +606,58 @@ class Primolix:
 
     # ---------- 真增量 update（方案 A） ----------
 
-    def update(self, root, workers=0):
-        """hash diff + 方案 A: 词表内走真增量, 词表外整库回退重建。
+    def compact_segments(self) -> dict:
+        """把已挂段全部折进主表 ＋ 落盘 ＋ 清分块缓存。
 
-        返回 {'kind': 'noop'|'incremental'|'rebuild', 'detail': str}。
+        `api.Index.compact()` 与 `update()` 的 `fold_first` 出口共用这一个实现。
+        顺序：折叠 → `_persist()`（先落盘）→ 追加 `folded_all`（提交点）→ 重建单块。
+        反过来就是"先提交后落盘"：崩溃时旁车说已折叠、npz 里没有那些行 ⇒ 段内容静默丢失。
+        """
+        bm = self._bm
+        segs = list(bm.segment_report())
+        if not segs:
+            return dict(folded=[], tags=[], blocks=len(bm._tc_blocks or []),
+                        N=int(bm.N), V=int(bm.V), ms=0.0, via=None)
+        t0 = time.time()
+        if len(segs) > 1:
+            # 多段时走内核的 `fold_all()`（`fold_segment` 的不变量在多段下不成立）
+            info = bm.fold_all()
+            bm._tc_blocks, bm._tc_rows = [], 0
+            bm._invalidate_w()
+            bm._recompute_stats()
+            self._persist()                       # ⭐ 先落盘（折叠改了 T 与 meta）
+            bm._ensure_tc()
+            tags = list(info["tags"])
+            folded = [dict(tag=t, **{k: v for k, v in info.items() if k != "tags"})
+                      for t in tags]
+            manifest_append(self.dir, {"event": "folded_all", "tags": tags,
+                                       "via": "compact/fold_all"})
+            via = "fold_all"
+        else:
+            folded = [dict(tag=t, **bm.fold_segment(t)) for t in segs]
+            tags = [f["tag"] for f in folded]
+            self._persist()                       # ⭐ 先落盘（同上）
+            manifest_append(self.dir, {"event": "folded_all", "tags": tags,
+                                       "via": "compact/fold_segment"})
+            bm._tc_blocks, bm._tc_rows = [], 0
+            bm._invalidate_w()
+            bm._recompute_stats()
+            bm._ensure_tc()                       # 立刻建回单块（否则下一次查询才建）
+            via = "fold_segment"
+        self._rows = None
+        return dict(folded=folded, tags=tags, blocks=len(bm._tc_blocks or []),
+                    N=int(bm.N), V=int(bm.V), ms=(time.time() - t0) * 1000.0, via=via)
+
+    def update(self, root, workers=0):
+        """hash diff ＋ 路由（`primolix.routing.route_update`）。
+
+        四个出口，返回里的 `kind` 与之一一对应：
+            noop         无改动
+            incremental  词表内 → 就地真增量
+            staged       含新词 → 挂只读段（`O(新 nnz)`，不重建）
+            rebuild      兜底：某条 precondition 不满足（dense / 段数上限 / 批太大）
+        判不了或安全执行不了（例如段在场却只能重建）→ 抛 `RuntimeError`，
+        不静默选一条。判据见 `04c_丙档OOV路由_设计与判据_2026-11-08.md`。
         """
         if self._bm is None:
             self._load()
@@ -605,34 +676,15 @@ class Primolix:
         if not (added or removed or changed):
             return {'kind': 'noop', 'detail': '库已同步, 无需重建'}
 
-        # ---- 收集新 chunk 文本 (added 全文件 + changed 文件的新内容) ----
-        new_chunk_texts = []
+        # ---- 收集新 chunk (added 全文件 + changed 文件的新内容)，分词一次复用 ----
         rel2scan = {x[0]: x for x in files}
+        new_chunk_texts = []
         for rel in added + changed:
             f = rel2scan.get(rel)
             if f is not None:
                 for t, _, _ in f[2]:
                     new_chunk_texts.append(t)
-
-        # ---- OOV 预检: 词表外词 → 整库回退重建 (拒绝静默丢词) ----
-        if new_chunk_texts:
-            oov = self._bm.oov_terms([zh_tokenize(t) for t in new_chunk_texts])
-            if oov:
-                n_oov = len(oov)
-                sample = sorted(oov)[:5]
-                _say(f"[方案A] 检测到 {n_oov} 个词表外词 {sample}… "
-                      f"(词表封闭, 真增量会静默丢词) → 整库回退重建")
-                self.rebuild_in_place(root, workers=workers)
-                _say(f"S4 回退重建完成 {time.time() - t0:.0f}s")
-                return {'kind': 'rebuild', 'detail': f'oov={n_oov}'}
-
-        # ---- 词表内安全: 走真增量 ----
-        # 需要墓碑的行 = removed 文件旧 chunk 行 + changed 文件旧 chunk 行
-        drop_rels = set(removed) | set(changed)
-        tomb_rows = [c['row'] for c in self._meta if c['file'] in drop_rels]
-        # 剩余活跃 chunk (保留): 整文件级替换 → removed/changed 的旧 chunk 全剔除
-        keep_meta = [c for c in self._meta if c['file'] not in drop_rels]
-        # 追加新 chunk (added 全文件 + changed 的新内容, 均来自本次 scan)
+        chunk_tokens = [zh_tokenize(t) for t in new_chunk_texts]
         append_chunks = []
         for rel in added + changed:
             f = rel2scan.get(rel)
@@ -643,15 +695,84 @@ class Primolix:
                 append_chunks.append(dict(docid=f'{h[:8]}:{len(append_chunks)}',
                                           file=rel, line=ln, text=t))
 
+        # ---- 墓碑/保留：整文件级替换（removed + changed 的旧 chunk 全剔除） ----
+        drop_rels = set(removed) | set(changed)
+        tomb_rows = [c['row'] for c in self._meta if c['file'] in drop_rels]
+        keep_meta = [c for c in self._meta if c['file'] not in drop_rels]
+        # 行号 ≥ T 行数 ⇒ 该行落在段里（段内不支持删除）—— 与"这批带不带新词"无关
+        seg_floor = int(self._bm.T.shape[0])
+        n_tomb_seg = sum(1 for r in tomb_rows if int(r) >= seg_floor)
+
+        # ---- 路由 ----
+        oov = self._bm.oov_terms(chunk_tokens) if chunk_tokens else set()
+        segs_n = len(self._bm.segment_report())
+        blocks_n = len(getattr(self._bm, "_tc_blocks", []) or []) or (segs_n + 1)
+        route = route_update(
+            n_added=len(added), n_changed=len(changed), n_removed=len(removed),
+            n_oov=len(oov), n_tomb_rows=len(tomb_rows), n_tomb_seg_rows=n_tomb_seg,
+            n_segments=segs_n, n_blocks=blocks_n,
+            dense_on=getattr(self, "_vecs", None) is not None,
+            batch_nnz=int(sum(len(t) for t in chunk_tokens)),
+            total_nnz=int(getattr(self._bm, "nnz", 0)),
+        )
+        _say(f"[路由] {route['route']}（{route['code']}）：{route['detail']}")
+        fold_note = ""
+        cinfo = None
+        if route['route'] == FOLD_FIRST:
+            # A / C：当场折回主表，把代价如实记进返回（不再让调用方自己去 compact）
+            cinfo = self.compact_segments()
+            fold_note = f"folded={len(cinfo['tags'])} fold_ms={cinfo['ms']:.1f}"
+            _say(f"[折] {cinfo['tags']} → 主表 {cinfo['N']} 行（{cinfo['ms']:.1f} ms）")
+            seg_floor = int(self._bm.T.shape[0])
+            n_tomb_seg = 0
+            route = dict(route, route=route['then'], detail=route['detail'])
+        if route['route'] == REBUILD:
+            self.rebuild_in_place(root, workers=workers)
+            _say(f"S4 回退重建完成 {time.time() - t0:.0f}s")
+            return {'kind': 'rebuild',
+                    'detail': f"oov={len(oov)} why={route['code']} {fold_note}".strip()}
+
+        # ---- staged：不重建，把这批挂成只读段 ----
+        if route['route'] == STAGED:
+            base_V = int(len(self._bm.idx2term))
+            base_T_rows = int(self._bm.T.shape[0])
+            new_pos, new_terms = {}, []
+            for toks in chunk_tokens:
+                for t in toks:
+                    if t in self._bm.term2idx or t in new_pos:
+                        continue
+                    new_pos[t] = base_V + len(new_terms)
+                    new_terms.append(t)
+            tag = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+            if tomb_rows:
+                self._bm._tombstone_rows(tomb_rows)
+            self._meta = keep_meta
+            rows = [(c['docid'], toks, c['file'], c['line'], c['text'])
+                    for c, toks in zip(append_chunks, chunk_tokens)]
+            out = publish_segment(self, rows, tag=tag, generation=tag,
+                                  base_V=base_V, base_T_rows=base_T_rows,
+                                  new_terms=new_terms, new_pos=new_pos)
+            self._rows = None          # ⭐ 失效行号缓存（段内文档已并入 _meta）
+            self._hashes = new
+            # 段在场 ⇒ `_persist()` 里的 `bm.save()` 会抛错：只落 meta(主表行)＋hashes。
+            self._persist_under_segments()
+            _say(f"S4 挂段完成 {time.time() - t0:.0f}s (新词 {len(oov)}, 段 {out['tag']}, "
+                  f"墓碑 {len(tomb_rows)} 行, 活跃 {len(self._meta)})")
+            return {'kind': 'staged',
+                    'detail': f"oov={len(oov)} tag={out['tag']} rows={out['rows']} "
+                              f"tomb={len(tomb_rows)} {fold_note}".strip(),
+                    'folded_tags': len(cinfo['tags']) if cinfo else 0}
+
+        # ---- incremental：词表内就地真增量 ----
         if tomb_rows:
             self._bm._tombstone_rows(tomb_rows)
-        new_rows = self._bm.append_docs([zh_tokenize(c['text']) for c in append_chunks])
+        new_rows = self._bm.append_docs(chunk_tokens)
         for c, row in zip(append_chunks, new_rows):
             c['row'] = int(row)
         self._meta = keep_meta + append_chunks
         self._rows = None          # ⭐ 失效行号缓存（行号已迁移/追加）
         self._hashes = new
-        self._persist()
+        self._persist()          # 走到这里 ⇒ 段已不在场（要折的已在上面折过）
         # dense: update 后整库重对齐 (rows 迁移, 旧向量错位; 小语料可负担)
         if self._dense:
             self._encode_dense()
@@ -659,7 +780,8 @@ class Primolix:
               f"(墓碑 {len(tomb_rows)} 行, 追加 {len(append_chunks)} chunk, "
               f"活跃 {len(self._meta)})")
         return {'kind': 'incremental',
-                'detail': f'tomb={len(tomb_rows)} append={len(append_chunks)}'}
+                'detail': f'tomb={len(tomb_rows)} append={len(append_chunks)} {fold_note}'.strip(),
+                'folded_tags': len(cinfo['tags']) if cinfo else 0}
 
     def rebuild_in_place(self, root, workers=0, *, force=False):
         """整库重建到同一目录（词表外回退 / 显式重建）。保持 dense 开关。
@@ -926,3 +1048,81 @@ def remount_staged(bm, index_dir) -> list:
             out.append(dict(tag=tag, mounted=False,
                             reason=f"stale/不可挂：{type(e).__name__}: {str(e)[:90]}"))
     return out
+
+
+def publish_segment(z, rows, *, tag, generation=None, base_V=None, base_T_rows=None,
+                    new_terms=(), new_pos=None, t2i=None, fold=False) -> dict:
+    r"""把一批 `(docid, toks, file, line, text)` 写成只读段并挂上。
+
+    `Stage.publish()`（门面的旁路累积）与 `Primolix.update()` 的 `staged` 分支
+    共用这一个实现 —— 段的提交顺序只有一处，不许各写一份。
+
+    顺序（既有不变量，不许调换）：
+        三个 `.npy` → `dl.npy` → 文档身份侧车 → `manifest` 追加（提交点）
+        → `mount_segment` → `_absorb_staged`（段内文档对产品层可见）。
+
+    调用方须已持写锁（`Index.add` / `Stage.publish` 都在锁内）。
+    段在场时 `SparseBM25.save()` 会抛错 ⇒ 调用方不能顺手 `_persist()`。
+    """
+    from collections import Counter
+
+    from scipy import sparse as sp
+
+    bm = z._bm
+    V0 = int(len(bm.idx2term) if base_V is None else base_V)
+    T0 = int(bm.T.shape[0] if base_T_rows is None else base_T_rows)
+    if len(bm.idx2term) != V0:
+        raise RuntimeError(f"基世代已变（base_V={V0} → {len(bm.idx2term)}）"
+                           f" → 这批必须重新分段（不静默重映射）")
+    if int(bm.T.shape[0]) != T0:
+        raise RuntimeError(f"主表行数已变（{T0} → {int(bm.T.shape[0])}）"
+                           f" → 有人就地追加过；先 `compact()` 再重来")
+    new_pos = dict(new_pos or {})
+    tag = str(tag)
+    gen = str(generation or tag)
+    M = len(new_terms)
+    seg_dir = Path(z.dir) / SEG_SUBDIR / tag
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    ri, ci, da = [], [], []
+    for i, (_docid, toks, _f, _l, _x) in enumerate(rows):
+        for t, c in Counter(toks).items():
+            col = t2i.get(t) if t2i is not None else bm.term2idx.get(t)
+            if col is None:
+                col = new_pos[t]
+            ri.append(i)
+            ci.append(col)
+            da.append(float(c))
+    csc = sp.csc_matrix((np.asarray(da, np.float32),
+                         (np.asarray(ri, np.int32), np.asarray(ci, np.int32))),
+                        shape=(len(rows), V0 + M))
+    np.save(seg_dir / f"{tag}.data.npy", np.asarray(csc.data, np.float32))
+    np.save(seg_dir / f"{tag}.idx.npy", np.asarray(csc.indices, np.int32))
+    np.save(seg_dir / f"{tag}.ptr.npy", np.asarray(csc.indptr, np.int32))
+    dl = np.asarray([len(toks) for _d, toks, _f, _l, _x in rows], np.float32)
+    np.save(seg_dir / "dl.npy", dl)
+    # 乙档：文档身份侧车先写好（沿用「段文件 → 侧车 → manifest 提交 → 挂段」）
+    row_base = int(bm.N)
+    with open(seg_dir / SEG_DOCS, "w", encoding="utf-8", newline="\n") as _fh:
+        for i, (_docid, _t, _f, _l, _x) in enumerate(rows):
+            _d = str(_docid)
+            _fh.write(json.dumps(dict(docid=_d, row=row_base + i,
+                                      file=(_f or _d), line=int(_l or 1),
+                                      text=_x), ensure_ascii=False) + "\n")
+    rec = dict(event="publish", tag=tag, generation=gen,
+               rows=len(rows), row_base=row_base, base_V=V0, m_new=M,
+               new_terms=list(new_terms), created=time.time(),
+               seg_dir=f"{SEG_SUBDIR}/{tag}", docs=SEG_DOCS)
+    manifest_append(z.dir, rec)                       # 提交点（append-only）
+    info = bm.mount_segment(str(seg_dir), tag, list(new_terms), dl,
+                            rows=len(rows), generation=gen)
+    # 乙档：立刻把段内文档补进产品层 `_meta`（否则本进程内 `search` 看不到它们）
+    absorbed = z._absorb_staged([dict(tag=tag, mounted=True)])
+    folded = None
+    if fold:
+        folded = bm.fold_segment(tag)
+        z._persist()                                  # 折叠必须落盘才算持久（O(总 nnz)）
+        manifest_append(z.dir, {"event": "folded_all", "tag": tag})
+    return dict(tag=tag, rows=len(rows), V0=V0, V1=V0 + M,
+                N=int(bm.N), V=int(bm.V), mounted=info, folded=folded,
+                meta_added=int(absorbed.get("added", 0)))
+

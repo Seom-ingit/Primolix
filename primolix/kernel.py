@@ -1121,6 +1121,11 @@ class SparseBM25:
         if int(T.shape[1]) < V1:                       # 扩列：只换形状，不拷数据
             T = csr_matrix((T.data, T.indices, T.indptr), shape=(int(T.shape[0]), V1))
         self.T = _sp_vstack([T, csc.tocsr()], format="csr").astype(np.float32)   # 追加行：O(nnz) 一次性
+        # 必须丢掉旧的预分配后端：`_Tbuf` 里还是折叠前那份行表，下一次 `append_docs()`
+        #    会 `self.T = self._Tbuf.wrap()` 把主表还原成折叠前（段的行静默消失，
+        #    而 `dl`/`dead`/`N` 仍是折叠后的长度 ⇒ 重载时 `len(dl) != T 行数` 直接崩）。
+        #    让下一次追加按新 `T` 重新预分配。
+        self._Tbuf = None
         if int(self.T.shape[0]) != n_before:
             raise RuntimeError(f"折叠后行数 {int(self.T.shape[0])} ≠ N {n_before}（挂段时已算过行数）")
         if int(self.T.shape[1]) != int(len(self.idx2term)):
@@ -1175,6 +1180,7 @@ class SparseBM25:
             rs.append(m)
         nnz_before = int(T.nnz)
         self.T = _sp_vstack([T] + rs, format="csr").astype(np.float32)
+        self._Tbuf = None                                  # 同 `fold_segment`：旧缓冲会让下一次 append 还原主表
         if int(self.T.shape[0]) != int(self.N):
             raise RuntimeError(f"折叠后行数 {int(self.T.shape[0])} ≠ N {int(self.N)}"
                                f"（挂段时已算过行数）")

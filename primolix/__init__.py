@@ -12,7 +12,7 @@ from .kernel import (SparseBM25, zh_tokenize, simple_tokenize,
 from .core import Primolix
 from .api import Index, RWLock, build_index, open_index
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # `open` 会遮蔽内置 `open` → 保留显式 `primolix.open(...)`，但不进 `__all__`。
 open = open_index
