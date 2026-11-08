@@ -144,6 +144,16 @@ invalidates it, and it then **falls back to on-the-fly scoring**); **cross-batch
 machine drift 20% to 40% (up to 2x in individual batches)**, so the multipliers above hold **within a
 batch only**.
 
+**0.2.0 selection stage (on by default; a different batch -- do not compare it with the batch above)**:
+1M chunks, `k=10`, 200 queries, ABBA over 4 rounds -- end-to-end p50 **5.92 -> 2.81 ms** (paired ratio
+0.484, 200/200 wins); same batch at `k=100` **6.03 -> 2.75 ms** (199/200). It replaces "sort the whole
+N-length array" with "sample 1/32 to pick a threshold, then select `k` among the candidates"
+(`TOPK_APPROX`). This is the **only probabilistic** step in the package: over the same 6,980 queries
+`R@10 0.4467` / `MRR@10 0.2794` are **bit-identical between the two arms**, there are 0 score violations,
+and the 73 queries with a different document order **never touch the answer** -- but in theory a boundary
+document can still be missed. For fully deterministic behaviour set `primolix.core.TOPK_APPROX = False`
+(`topk_stats()` reports which branch each arm actually took).
+
 Good fit: documents that change often, repeated parameter tuning, explaining ranked results, and
 auditing retrieval. Poor fit: read-only corpora that never change **with the materialised layer off**,
 and pushing single-query latency to the limit.
@@ -176,9 +186,14 @@ and pushing single-query latency to the limit.
    view family in [docs/api.en.md](docs/api.en.md)), but **the released CI does not cover the view
    path** -- end-to-end and kernel unit tests cover build, query, incremental write, formula change,
    delete, reload, and segment mount/fold/unmount (U10-U12).
-4. **Attribution.** Any (query, document) score decomposes per term into
-   `idf x saturation(tf) x document length`, and the score under different parameters can be
-   computed on the spot.
+4. **Attribution, including "why did it find nothing".** Any (query, document) score decomposes per
+   term into `idf x saturation(tf) x document length`, and the score under different parameters can be
+   computed on the spot. **Since 0.2.0 two previously unanswerable questions are answered**: terms
+   outside the vocabulary are no longer skipped silently (`status='oov'`, `in_vocab=False`,
+   contribution 0, and **not** truncated by `top`); a query that matched nothing gets `diagnose()`,
+   which returns `status` (`all_oov` / `no_positive` / `partial_oov` / `ok`), per-term evidence and
+   plain-language messages; `explain(..., diagnose=True)` attaches the same diagnosis to the
+   attribution result (the default still returns a `list`, so existing callers keep working).
 5. **Incremental reconciliation.** After a change, checking the primitives is enough to confirm the
    result; a full rebuild is not required.
 6. **Compaction.** Append-only growth increases the number of index blocks and slows queries down;
@@ -217,7 +232,7 @@ cross-environment guarantee. Without `W_CACHE`, queries are slower than a precom
 `W_CACHE` on and a read-only index they can overtake it), and resident memory looks larger when shared
 pages are counted — both are visible in the data and are not argued away.
 
-## Performance switches: three on by default, two left to you
+## Performance switches: five on by default, three left to you
 
 The default path already carries every "free" optimisation, and they are **bit-exact** — you do not
 have to do anything for them:
@@ -228,6 +243,7 @@ have to do anything for them:
 | `DN_PRECOMP` | on | precompute the per-document normalisation term | 4 MB at 1M (N-level), plus ~4 ms once |
 | `ADD_AT` | on | unbuffered accumulation | none (bit-exact, zero memory) |
 | `SWAP_LOCK` | on | **concurrency safety**: swaps and queries exclude each other (concurrent readers, exclusive writer) | about **+3.4 us/query** (17.6% on a tiny index, ~7% at 44.7k chunks) |
+| `TOPK_APPROX` | on | **0.2.0**: the selection stage samples 1/32 to pick a threshold and then selects `k` among the candidates (1M, `k=10`: 5.92 -> 2.81 ms end to end) | the only **probabilistic** step in the package: an extreme distribution can miss a boundary document, worst case falls back to the exact path; set it to `False` for fully deterministic behaviour |
 
 The two below are **off by default** — not an oversight: each trades a different axis for latency, so
 the choice belongs to your workload.
@@ -252,6 +268,12 @@ the choice belongs to your workload.
   (`private` drops noticeably while `RSS` rises, because shared pages count towards RSS).
 - If it cannot be published it **falls back safely** to a private CSC: slower, never wrong.
 
+**`WRITE_VEC` (vectorised write path, kernel level, off by default) — decide by workload shape.**
+For "many appends inside one process" it pays: once the lookup table exists, the write unit price goes
+from **6.15 to 0.64 us/posting** (carrier in place, K=100: 9.5x; K=5000: 16.0x). For "one append for the
+whole batch" it is **slower** (33.2 vs 23.2 ms) -- it has to build the lookup table first (~31 ms at
+V=63,314). Its output is **bit-identical** to the legacy path: the switch changes cost only, never a score.
+
 **Not recommended**: `WRITE_DICT` (measured no gain), `MATVEC` (measured 27% slower).
 
 For finer switch semantics, invalidation rules and payback calibers see the "How to choose a switch"
@@ -274,6 +296,7 @@ idx.search("sparse kernel", k=10)                 # text in, hits out (tokenised
 idx.add("my_docs")                                # incremental (OOV -> honest rebuild)
 idx.tune(k1=2.0, b=0.3)                           # change the formula: no rebuild
 idx.explain("sparse kernel")                      # attribution: split the score per term
+idx.diagnose("sparse kernel")                     # diagnosis: why nothing matched / why only these (0.2.0)
 idx.stats(); idx.segments(); idx.views(); idx.compact()   # overview / segments / views / compaction
 ```
 
@@ -284,6 +307,7 @@ python -m primolix info    --out my_docs/.idx                 # overview: size /
 python -m primolix params  --out my_docs/.idx --k1 2.0        # change the formula (--save persists)
 python -m primolix config  --set W_CACHE=true                 # switches (process-wide)
 python -m primolix explain "sparse kernel" --out my_docs/.idx  # attribution per term
+python -m primolix diagnose "sparse kernel" --out my_docs/.idx # diagnosis: why nothing matched (0.2.0)
 python -m primolix segment list --out my_docs/.idx            # segments: list / mount / unmount / fold
 python -m primolix view    list --out my_docs/.idx            # views: list / attach / detach / fuse
 python -m primolix compact --out my_docs/.idx                 # compaction: fold mounted segments in
@@ -333,16 +357,20 @@ python tests/test_staged_publish.py   # staged publish: mount / fold / unmount, 
 ```
 
 All three print `PASS` / `FAIL` per check and exit non-zero on failure. No external data is needed.
-Coverage: kernel **U1-U23** (including segment mount / fold / unmount, U10-U12; U20 pins "load then
-update again" and "a `.mm/` generation-key mismatch is refused"), plus 10 end-to-end checks and
-7 staged-publish checks (T1-T7) at the index layer. **Not covered**: the view family.
+Coverage: kernel **U1-U26** (including segment mount / fold / unmount, U10-U12; U20 pins "load then
+update again" and "a `.mm/` generation-key mismatch is refused"; U23 pins that the build-time
+tokenization mode is persisted; U24 pins both approximate-top-k arms really ran and the score multiset
+is identical; U25 pins `WRITE_VEC` against the legacy append, bit-exact), plus **11** end-to-end checks
+(including the diagnose / OOV contract) and 7 staged-publish checks (T1-T7) at the index layer.
+**Not covered**: the view family, and a cross-implementation parity run of `span` against the frontend
+`lib/span.ts` (only the unit contract is pinned).
 
 ## Layout
 
 ```
 primolix/    package: CLI, index object, BM25 kernel, one-line facade, vocabulary carrier,
-             cross-process sharing
-             (cli.py, core.py, kernel.py, api.py, tc_shared.py, vocab_mmap.py)
+             cross-process sharing, span location
+             (cli.py, core.py, kernel.py, api.py, span.py, tc_shared.py, vocab_mmap.py)
 tests/       end-to-end and unit tests (English output)
 examples/    runnable examples: run_examples.py (kernel and index object)
 docs/        API and index-format docs, when-to-use guidance, and research records

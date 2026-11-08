@@ -111,6 +111,16 @@ bm = SparseBM25.load("idx/bm25.npz")                          # 从盘加载（c
 `primolix.core` 还导出可调常量：`MAX_CHUNK`（默认 1200）· `CODE_BLOCK_LINES`（80）· `MAX_FILE_BYTES`（2 MB）·
 `EXCLUDE_DIRS` / `EXCLUDE_EXT` / `CODE_EXT` / `PROSE_EXT`（扫描与分块规则）。
 
+**选择段（0.2.0）**：`primolix.core.TOPK_APPROX`（默认 `True`）· `TOPK_FRAC`（32）· `TOPK_SHRINK`（0.98）·
+`topk_stats(reset=False)`。`topk_stats()` 返回本线程 `_topk_idx` 的 `calls / approx / exact / fallback / cand`
+—— 用来**自证"这一臂真的走了哪条路"**（近似路径没被触发时，"两臂打平"是没有信息量的）。
+`TOPK_APPROX = False` 即完全确定（只有精确路径）。
+
+**`primolix.span`（meta 层定位，不进打分链路）**：`hit_span(text, query)` 给最小覆盖跨度 `(start, end)`
+（整串命中优先，无词法命中返回 `None`）· `hit_ranges(text, tokens)` 给每个词的全部出现区间 · 
+`query_tokens(q)` 与前端 `lib/span.ts` 同款切分（空白 + 中英标点，不做真分词）。口径是**纯子串匹配**，
+所以调用方与前端可以逐行对拍；它**不参与 BM25 打分**，也**不改 `tokenize` 的工作**。
+
 ## 5. 契约与坑（实测）
 
 | # | 契约 / 坑 |
@@ -126,6 +136,9 @@ bm = SparseBM25.load("idx/bm25.npz")                          # 从盘加载（c
 | 9 | **两套 id 空间**（若你自带语料）：`vocab.json` 之类的"词表"未必等于索引的列空间，只按字符串走 `term2idx`，别拿外部数字当列号 |
 | 10 | **物化层、`.mm/` 与共享 CSC 都要看"失效条件"**：`W_CACHE` 的键含参数与块结构（换参、写入、墓碑都会让它失效）；**`.mm/` 有世代键 `mm_key.txt`**（npz 的名字／mtime／size；不符则**整个 `.mm/` 拒用**，回落到 npz 自带的 `T_data`）；`TC_SHARED` 的键是**主表那一份**（`路径\|mtime\|shape\|nnz`），所以只有**重存索引／换版／主表形状或 nnz 变**才会不再命中，**挂段与卸段不影响它**（共享的 CSC 由主表 `T` 建，而挂/卸段**不动 `T`**）。另有一个为"段参与共享"预留的 `_seg_key()`，**目前没有任何调用点**（别假定它生效）。三者都不是"打开就一劳永逸"，用前先想清失效后谁付重建成本。 |
 | 11 | **常驻内存有两个口径**：`private`（私有）与 `RSS`（含共享页）。`mmap` postings 与共享 CSC 会让两者给出**相反**结论 —— 单报任一个都会误导；引用本包数字时请注明口径（README 的表标的是**私有**口径，不含共享页）。 |
+| 12 | **近似 top-k 是概率保证，不是等式**（`TOPK_APPROX`，0.2.0 默认开）：阈值 = 采样第 k 大 × `TOPK_SHRINK`，理论上可能高于真第 k 大、**漏掉边界文档**。三种形态**自动回精确路径**（非浮点 / 非正分布 / 正分不足 k），返回仍是"k 个下标、分数降序、值等于全量排序前 k 个"这条老契约。已测范围：1M 中文 · 6,980 查询（`R@10` / `MRR@10` 两臂逐位相同）· `k∈{10,100,1000}` · `frac∈{16,32}`；**未测** 8.84M、dense 分支（`k*10`）、短查询与高重复分布。要确定性行为就 `TOPK_APPROX = False`。 |
+| 13 | **`WRITE_VEC`（写路径向量化）默认关，且它只影响成本**：输出与 legacy 逐位相同（`T`/`df`/`dl`/分数全等），但"整批只 append 一次"时**更慢**（要先建表 ≈31 ms @V=63,314），所以写单价必须**按形态两报**：重复批 0.34–0.64 µs/posting，一次性 33.2 vs 23.2 ms。别把它当"开了就快"的开关。 |
+| 14 | **`explain()` 的 `status` 是唯一判别字段**：`ok` / `oov` / `no_tf` / `unavailable`。**别用 `contribution == 0` 反推** —— OOV 是 0（它确实没贡献），`no_tf`（这篇里没这个词）与 `unavailable`（取不到 tf）语义不同，后者 `contribution` 是 `None`、`tf` 也是 `None`（**不拿 0 冒充**）。`top` 只限制**有贡献**的词条数，其余三类**必出**。 |
 
 ## 6. 常见任务（最短路径）
 
@@ -190,6 +203,7 @@ idx.search("稀疏 检索", k=5)                  # 文本进、结果出（自�
 idx.add("docs/")                             # 增量（词表外则如实回退重建，kind='rebuild'）
 idx.tune(k1=2.0, b=0.3)                      # 换公式：不重建、不动物料
 idx.explain("稀疏 检索")                      # 归因：分数按词拆开
+idx.diagnose("稀疏 检索")                     # 诊断：为什么没搜到 / 为什么只有这些（0.2.0）
 idx.stats()                                  # 规模 / 开关 / 段数 / 视图数
 idx.compact()                                # 压实：把已挂段并进主表，查询恢复单块
 idx.save(w_cache=True)                       # 写入磁盘（可选把物化层 w 一起写）
@@ -199,7 +213,8 @@ idx.save(w_cache=True)                       # 写入磁盘（可选把物化层
 |---|---|
 | `open(path)` · `open_index(...)` · `build(root, out, ...)` · `build_index(...)` | 入口；`build(..., w_cache=True)` 时建库会把物化层 `w` 一并写入磁盘 |
 | **并发安全默认开** | 门面持一把**读写锁**（`RWLock`）：`search`/`stats`/`explain`/`fuse` 走**共享**侧，`add`/`rebuild`/`tune`/段三阶段/`compact`/视图写入/`save` 走**独占**侧，所以读者之间并发、写者与读者互斥，**同一对象被多线程同时用，不会拿到错分数**（依据：无锁时约 **3%**（多次实测 2.3%–3.7%）的并发读数撕裂，其中 **96% 是静默错分**） |
-| 段 | `mount(seg_dir, tag, new_terms, dl, rows=None, generation=None)` · `unmount(tag)` · `fold(tag)` · `segments()` |
+| 归因与诊断 | `explain(q, docid=, k=1, top=6, diagnose=False)`：`status` 四态（见第 5 节 #14）；`diagnose=True` 返回 `dict(contributions=..., diagnosis=...)`，**默认仍返回 `list`**（不破坏既有调用方）· `diagnose(q, k=10)`：`status`（`ok`/`partial_oov`/`all_oov`/`no_positive`/`no_tokens`）＋ `terms`（逐词 `in_vocab`/`df`/`df_ratio`/`idf`）＋ `scores` ＋ `messages` · 位置定位用 `primolix.span`（第 4 节） |
+| 段 | `mount(seg_dir, tag, new_terms, dl, rows=None, generation=None)` · `unmount(tag)` · `fold(tag)` · `segments()` · `stage_begin()`（其 `add(docid, text_or_tokens, file=, line=)` 自 0.2.0 起可给段内文档补**真实路径与行号**；缺省用 `docid` 当 `file`、`line=1`，**不编造路径**） |
 | 视图 | `views()` · `attach_view(name, vectors, positions=None, ...)` · `detach_view(name)` · `fuse(q, qvec, name, alpha=0.35)` · `save_view` / `load_views` |
 | 参数与开关 | `tune(k1=, b=, persist=)` · `stats()`（含各开关当前值）· `set_switches(**kw)`（类属性，进程级） |
 | 写入磁盘 | `save(path=None, w_cache=False)`：缺省写回索引目录；给 `path` 则只把**内核索引**另存一份 |

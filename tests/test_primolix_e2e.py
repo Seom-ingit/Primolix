@@ -15,6 +15,7 @@ Checks (each prints PASS/FAIL; process exits 1 if anything fails):
   7  out-of-vocabulary term: update or rebuild_in_place, then findable
   8  delete: a removed file is no longer listed / findable
   9  reload from disk is deterministic (same files and scores)
+  10 facade: `diagnose()` explains an all-OOV query; `explain(diagnose=True)` is opt-in only
 
   Not covered here: the view family (see docs/api.md).
 """
@@ -167,6 +168,20 @@ h1 = [(h["file"], round(h["score"], 6)) for h in z.query(q, k=3)]
 z2 = Primolix(str(idx))
 h2 = [(h["file"], round(h["score"], 6)) for h in z2.query(q, k=3)]
 check("9 reload is deterministic", h1 == h2, f"{len(h1)} hits compared")
+
+# ---------------------------------------------------------------- 10 facade: diagnose / explain(diagnose=True)
+# The product-side question is "why is it empty", not "why is this one on top". `diagnose()` answers the
+# former; `explain(diagnose=True)` opt-in must keep the plain-list shape intact for existing callers.
+zi = primolix.open(str(idx))
+d10 = zi.diagnose("qwxzvzz qqqvvv")
+e10 = zi.explain("cooking", diagnose=True)
+e10_plain = zi.explain("cooking")
+check("10 diagnose explains an all-OOV query; explain(diagnose=True) is opt-in only",
+      d10.get("status") == "all_oov" and bool(d10.get("messages"))
+      and isinstance(e10, dict) and "contributions" in e10 and "diagnosis" in e10
+      and isinstance(e10_plain, list),
+      f"status={d10.get('status')!r} · terms={len(d10.get('terms') or [])}"
+      f" · explain->{type(e10).__name__}/diagnose={type(e10_plain).__name__}")
 
 shutil.rmtree(work, ignore_errors=True)
 print("-" * 60)

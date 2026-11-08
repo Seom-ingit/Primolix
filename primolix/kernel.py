@@ -11,6 +11,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import wraps
+from itertools import chain as _chain
 
 import numpy as np
 
@@ -452,6 +453,11 @@ class SparseBM25:
     #    `FAST_SCORE` 是 `DN_PRECOMP`/`ADD_AT`/`W_CACHE` 的总闸：不开它那三个开关在默认路径上全部失效。
     #    逐位：只做"不改变浮点运算顺序"的改动；`WRITE_DICT` 的收益：写路径逐词查找 5.163µs → 0.214µs。
     WRITE_DICT = False
+    # 01l：批量向量化写路径（opt-in，默认关，不改默认行为）——
+    #      `append_docs` 把"逐词 Python 循环"换成"一次映射 ＋ `np.unique` ＋ `bincount`"。
+    #      载体在岗（`term2idx` 是 `VocabMmap`）时它会建一次 dict 并缓存
+    #      （一次 O(V) ≈0.5 µs/词）：因为逐词走 mmap 二分是 4.35 µs/次，批量也救不了。
+    WRITE_VEC = False
     # 01f：预计算"每行规范化项" `dn[d] = k1(1-b+b·dl/avgdl)`（N 级，1M 段 ≈4 MB），
     #      查询期省掉每 posting 一次 `dl[rows]` gather ＋ 3 次逐元素运算。
     #      表达式与现算逐字同形, 逐位等价；只在 `FAST_SCORE=True` 的路径里生效。
@@ -576,7 +582,7 @@ class SparseBM25:
                     doc_toks = [tok(d) for d in docs]
             else:
                 doc_toks = [tok(d) for d in docs]
-            # pass1: 词表（复用 doc_toks）＋ 顺手取**精确 nnz**（`len(set(toks))` ＝ pass2 的 tf 条目数）
+            # pass1: 词表（复用 doc_toks）＋ 顺手取精确 nnz（`len(set(toks))` ＝ pass2 的 tf 条目数）
             nnz_hint = 0
             for i, toks in enumerate(doc_toks):
                 self.dl[i] = len(toks)
@@ -963,7 +969,12 @@ class SparseBM25:
         if k >= n:
             idx = np.arange(n)
         else:
-            idx = np.argpartition(-s, k - 1)[:k]      # kth 靠近开头（比"末尾"快）
+            # 01m（P-D）：原地取负，省掉一个 N 长临时（@8.84M ≈35 MB/查询）。
+            #    `s` 是本函数刚建出来的局部量 ⇒ 就地改写对调用方不可见；
+            #    `-(-x)` 对含 ±0 的 float 也逐位恒等 ⇒ 返回的 `s[idx]` 与改前一致。
+            np.negative(s, out=s)
+            idx = np.argpartition(s, k - 1)[:k]      # kth 靠近开头（比"末尾"快）
+            np.negative(s, out=s)                    # 还原
         if sort:
             idx = idx[np.argsort(-s[idx])]
         return idx, s[idx]
@@ -1177,7 +1188,7 @@ class SparseBM25:
                        ms=(time.perf_counter() - t0) * 1e3)
             folded[_tag] = rec
             del self._segments[_tag]
-        self._folded = {**getattr(self, "_folded", {}), **folded}
+        self._folded = {getattr(self, "_folded", {}), folded}
         return dict(tags=list(folded), rows=int(len(rs)), ms=(time.perf_counter() - t0) * 1e3,
                     nnz_before=nnz_before, nnz_after=int(self.T.nnz),
                     N=int(self.N), V=int(self.V))
@@ -1295,6 +1306,8 @@ class SparseBM25:
                 f"（纯删除走 `_tombstone_rows` 不受此限）")
         k = len(toks_list)
         base = self.N
+        if type(self).WRITE_VEC:          # 01l：批量向量化（逐位等价，论证见 `_append_docs_vec`）
+            return self._append_docs_vec(toks_list, k, base)
         #  写路径的词表查找：dict 优先（`WRITE_DICT=True` 时按需建一次并缓存到实例）；
         t2i = getattr(self, "_write_dict", None)
         if t2i is None and type(self).WRITE_DICT:
@@ -1326,6 +1339,59 @@ class SparseBM25:
                           counts)
         self.T = self._Tbuf.wrap()
         self.dl = np.concatenate([self.dl, np.asarray([len(t) for t in toks_list], dtype=np.float32)])
+        if self._dead is not None:
+            self._dead = np.concatenate([self._dead, np.zeros(k, dtype=bool)])
+        self.N = base + k
+        self._invalidate_w()
+        self._recompute_stats()
+        self._views_extend(k)
+        return np.arange(base, base + k)
+
+    def _append_docs_vec(self, toks_list, k, base):
+        r"""`WRITE_VEC=True` 的批量向量化写路径（与 `append_docs` 逐位等价）。
+
+        等价性论证（三条都必须成立，否则逐位必挂）：
+        ① 一行一词一条：legacy 用 `defaultdict` 计数 ⇒ 唯一；这里对 `doc*V + col`
+           复合键做 `np.unique` ⇒ 同样唯一，且列号升序；
+        ② 行内顺序无关：`PreallocCSR.append` 之后必过 `_sort_new_rows`（按列 `kind="stable"`）
+           ⇒ legacy 的"首次出现序"与这里的"列升序"排完同形（升序是稳定排序的不动点）；
+        ③ 统计量：`df[ci] += 1` 每 `(doc, 词)` 一次 ⇔ `bincount(cols)`；`dl` 用 `len(toks)`
+           （含表外词，与 legacy 的 `len(t)` 一字不差）。
+        词表封闭：表外词映射为 `-1` 后整条丢掉（与 legacy 的 `continue` 同义）。
+        """
+        # ① 查找表：载体在岗（`VocabMmap`）⇒ 建一次 dict 并缓存（一次 O(V)，批量必然赚）
+        t2i = getattr(self, "_write_dict", None)
+        if t2i is None:
+            t2i = self.term2idx
+            if type(t2i) is not dict:
+                t2i = self._write_dict = {t: i for i, t in enumerate(self.idx2term)}
+        # ② 展平 ＋ 每篇 token 数（`dl` 用它）
+        lens = np.fromiter((len(t) for t in toks_list), dtype=np.int64, count=k)
+        flat = list(_chain.from_iterable(toks_list))
+        # ③ 一次映射（表外 = -1）
+        get = t2i.get
+        ids = np.fromiter((get(w, -1) for w in flat), dtype=np.int64, count=len(flat))
+        del flat
+        # ④ (doc, col) 唯一化 ⇒ 计数与列号（列升序 ⇒ 见论证②）
+        doc = np.repeat(np.arange(k, dtype=np.int64), lens)
+        keep = ids >= 0
+        doc, ids = doc[keep], ids[keep]
+        del keep
+        V = int(self.df.size)
+        uniq, cnt = np.unique(doc * V + ids, return_counts=True)
+        d_u = uniq // V
+        c_u = (uniq - d_u * V).astype(np.int32)
+        counts = np.bincount(d_u, minlength=k).astype(np.int64)   # 空行/全表外 ⇒ 0
+        tfs = cnt.astype(np.float32)                              # tf 为整数 ⇒ 精确
+        del doc, ids, uniq
+        # ⑤ 追加（`PreallocCSR.append` 的第 1 个参数只取长度 ⇒ 传 cols 即可，不另分配）
+        if self._Tbuf is None:
+            self._Tbuf = PreallocCSR.from_csr(self.T.tocsr(), slack=self.T_SLACK)
+        self._Tbuf.append(c_u, c_u, tfs, counts)
+        self.T = self._Tbuf.wrap()
+        # ⑥ 统计量与行空间（与 legacy 同序、同 dtype）
+        self.df += np.bincount(c_u, minlength=V).astype(self.df.dtype)
+        self.dl = np.concatenate([self.dl, lens.astype(np.float32)])
         if self._dead is not None:
             self._dead = np.concatenate([self._dead, np.zeros(k, dtype=bool)])
         self.N = base + k

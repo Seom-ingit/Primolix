@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -21,14 +22,14 @@ import numpy as np
 import scipy.sparse as sp
 
 from . import kernel
-from .core import Primolix, get_dense_model
+from .core import Primolix, get_dense_model, _topk_idx
 from .kernel import RWLock, SparseBM25, zh_tokenize     # RWLock 复用内核的可重入实现
 
 __all__ = ["RWLock", "Index", "open_index", "build_index", "set_switches"]
 
 # 门面可切换的开关（都是类属性 → 影响本进程内所有索引）
 SWITCHES = ("FAST_SCORE", "DN_PRECOMP", "ADD_AT", "W_CACHE", "MATVEC", "WRITE_DICT",
-            "TC_SHARED", "EAGER_TC", "SWAP_LOCK", "T_SLACK")
+            "WRITE_VEC", "TC_SHARED", "EAGER_TC", "SWAP_LOCK", "T_SLACK")
 
 
 # 门面自用的锁：复用内核的可重入读写锁。内核只保证单次调用的原子性；门面有跨调用组合的操作
@@ -58,7 +59,11 @@ class Index:
 
     # ---------------------------------------------------------------- 读
     def search(self, q: str, k: int = 10, *, dense: bool = False) -> list[dict]:
-        """检索：文本进、结果出（自动分词）。返回 `[{rank, score, file, line, text}]`。"""
+        """检索：文本进、结果出（自动分词）。返回 `[{rank, score, docid, file, line, text}]`。
+
+        `docid` 是 additive 字段（2026-10-18 乙档）：段内文档常常没有真实 `file/line`，
+        只靠 `file/line` 认不出来。
+        """
         with self._lock.read():
             return self._z.query(q, k=k, dense=dense)
 
@@ -85,42 +90,169 @@ class Index:
         with self._lock.read():
             return self._z.browse(file=file, page=page, n=n)
 
-    def explain(self, q: str, *, docid: str | None = None, k: int = 1, top: int = 6) -> list[dict]:
+    def explain(self, q: str, *, docid: str | None = None, k: int = 1, top: int = 6,
+                diagnose: bool = False):
         """归因：把第 `k` 名的分数按词拆成 `idf × tf 饱和 × 文档长度` 的贡献。
 
-        `docid` 给定时拆那一篇（按 `file:line` 或文件名匹配），否则拆当前第 `k` 名。
+        `docid` 给定时拆那一篇（按文件名片段匹配，全库找、取该文件分最高的 chunk），
+        否则拆当前第 `k` 名。
+
+        2026-10-19 补两处（此前这两问答不了）：
+        1. 词表外（OOV）不再被静默跳过：显式出现在返回列表里（`in_vocab=False`、
+           `contribution=0.0`），且不受 `top` 截断 —— 产品上「这个词你的库里没有」
+           是最要紧的一句，不能被 `top` 挤掉。
+        2. 没搜到时不再只返回空 list：`diagnose=True` ⇒ 返回
+           `dict(contributions=[...], diagnosis={...})`，`diagnosis` 说清为什么没搜到。
+           默认仍返回 `list`（向后兼容现存调用方）；只想看诊断可直接调 `diagnose()`。
+
+        `top` 只限制有贡献的词条数；`status` 为 `oov` / `no_tf` / `unavailable`
+        的项必出（它们解释的是"为什么这个词没帮上忙"）。
         """
-        from collections import Counter
         with self._lock.read():
-            hits = self._z.query(q, k=max(k, 1))
-            if not hits:
-                return []
-            hit = hits[min(k, len(hits)) - 1]
+            qtoks = zh_tokenize(q)
+            s = self._z._score_active(qtoks)
             if docid:
-                cand = [h for h in hits if docid in (h["file"] or "")]
-                if not cand:
-                    raise KeyError(f"本次 top-{len(hits)} 里没有匹配 {docid!r} 的文档")
-                hit = cand[0]
+                rows = [i for i, m in enumerate(self._z._meta)
+                        if docid in (m["file"] or "")]
+                if not rows:
+                    raise KeyError(f"库里没有文件名匹配 {docid!r} 的文档")
+                row = int(max(rows, key=lambda i: float(s[i])))
+            else:
+                # 无正分 ⇒ 没有"第 k 名"可拆。旧实现在这里 `return []`，
+                if s.size == 0 or not bool((s > 0).any()):
+                    return (dict(contributions=[], diagnosis=self._diagnose(q, k, s, qtoks))
+                            if diagnose else [])
+                order = _topk_idx(s, max(int(k), 1))
+                row = int(order[min(max(int(k), 1), len(order)) - 1])
             bm = self._z._bm
-            row = int(next(m["row"] for m in self._z._meta
-                           if m["file"] == hit["file"] and m["line"] == hit["line"]))
             dl, avg, n = float(bm.dl[row]), float(bm.avgdl), int(bm.N)
+            avg = avg if avg > 0 else 1.0          # 空索引/单文档时 avgdl 可能为 0
             T = bm.T.tocsr() if bm.T is not None else None
-            out = []
-            for t, cnt in Counter(zh_tokenize(q)).items():
+            nT = int(T.shape[0]) if T is not None else 0
+            # 段内文档（未折叠）的物理行不在主表 `T` 里 ⇒ 去分块里取 tf（否则 `T[row, c]` 越界）
+            blk = None
+            for _c, _rb in (getattr(bm, "_tc_blocks", []) or []):
+                if int(_rb) <= row < int(_rb) + int(_c.shape[0]):
+                    blk = (_c, int(_rb))
+                    break
+            contrib, extra = [], []
+            for t, cnt in Counter(qtoks).items():
                 c = bm.term2idx.get(t)
-                if c is None or T is None:
-                    continue
-                tf = float(T[row, c])
-                if tf <= 0:
+                if c is None:
+                    extra.append(dict(term=t, q_count=int(cnt), in_vocab=False,
+                                      status="oov", tf=0.0, df=0.0, idf=0.0,
+                                      contribution=0.0))
                     continue
                 df = float(bm.df[c])
                 idf = float(np.log((n - df + 0.5) / (df + 0.5) + 1.0))
+                if T is not None and row < nT:
+                    tf = float(T[row, c])
+                elif blk is not None:
+                    tf = float(blk[0][row - blk[1], c])
+                else:
+                    extra.append(dict(term=t, q_count=int(cnt), in_vocab=True,
+                                      status="unavailable", tf=None, df=df, idf=idf,
+                                      contribution=None))
+                    continue
+                if tf <= 0:
+                    extra.append(dict(term=t, q_count=int(cnt), in_vocab=True,
+                                      status="no_tf", tf=0.0, df=df, idf=idf,
+                                      contribution=0.0))
+                    continue
                 sat = tf * (bm.k1 + 1.0) / (tf + bm.k1 * (1.0 - bm.b + bm.b * dl / avg))
-                out.append(dict(term=t, q_count=int(cnt), tf=tf, df=df, idf=idf,
-                                contribution=idf * sat))
-            out.sort(key=lambda d: -d["contribution"])
-            return out[:top]
+                contrib.append(dict(term=t, q_count=int(cnt), in_vocab=True,
+                                    status="ok", tf=tf, df=df, idf=idf,
+                                    contribution=idf * sat))
+            contrib.sort(key=lambda d: -d["contribution"])
+            out = contrib[:max(int(top), 0)] + extra
+            if diagnose:
+                return dict(contributions=out, diagnosis=self._diagnose(q, k, s, qtoks))
+            return out
+
+    def _diagnose(self, q: str, k: int = 10, s=None, qtoks=None) -> dict:
+        """（内部）为什么没搜到 / 为什么只搜到这些 —— 只输出有把握的判断。
+
+        每条 `messages[*]` 都带 `evidence`（可点开验证的实数）与 `action`（人话动作），
+        符合本层「不许静默、解释必须可举证」的约定。不猜：拿不到的数一律不编。
+        """
+        qtoks = list(qtoks if qtoks is not None else zh_tokenize(q))
+        s = self._z._score_active(qtoks) if s is None else s
+        bm = self._z._bm
+        n = int(bm.N) or 1
+        n_active = int(self._z._active_rows().size)
+        terms, oov = [], []
+        for t, c0 in Counter(qtoks).items():
+            ci = bm.term2idx.get(t)
+            if ci is None:
+                oov.append(t)
+                terms.append(dict(term=t, q_count=int(c0), in_vocab=False,
+                                  df=0, df_ratio=None, idf=None))
+                continue
+            df = int(bm.df[ci])
+            idf = float(np.log((n - df + 0.5) / (df + 0.5) + 1.0))
+            terms.append(dict(term=t, q_count=int(c0), in_vocab=True, df=df,
+                              df_ratio=round(df / n, 6), idf=round(idf, 6)))
+        n_pos = int((s > 0).sum()) if s.size else 0
+        if not qtoks:
+            status = "no_tokens"
+        elif not any(t["in_vocab"] for t in terms):
+            status = "all_oov"
+        elif n_pos == 0:
+            status = "no_positive"
+        elif oov:
+            status = "partial_oov"
+        else:
+            status = "ok"
+        msgs = []
+        if status == "no_tokens":
+            msgs.append(dict(level="warn", what="这句话里没有能用来检索的内容",
+                             evidence=dict(tokens=qtoks),
+                             action="换一句更具体的话"))
+        if n_active == 0:
+            msgs.append(dict(level="warn", what="索引里没有活跃文档",
+                             evidence=dict(N=int(bm.N), n_active=0),
+                             action="先入库再查"))
+        if oov:
+            msgs.append(dict(level="warn" if status == "all_oov" else "info",
+                             what=f"这 {len(oov)} 个词你的资料库里没有：" + "、".join(oov),
+                             evidence=dict(oov=oov, V=int(bm.V)),
+                             action="补一份含这些词的资料，或换成库里已有的说法"))
+        if status == "no_positive":
+            msgs.append(dict(level="warn", what="库里有这些词，但没有任何一条文档同时命中",
+                             evidence=dict(n_positive=0, terms=[t["term"] for t in terms
+                                                              if t["in_vocab"]]),
+                             action="删掉一两个限定词再试"))
+        # 低区分度词：df_ratio 是实数，直接可举证；0.5 是经验阈值（不是统计结论）
+        low = [t for t in terms if t["df_ratio"] is not None and t["df_ratio"] >= 0.5]
+        if low:
+            msgs.append(dict(level="info",
+                             what="这些词库里多数文档都有，帮你筛不出东西："
+                                  + "、".join(x["term"] for x in low),
+                             evidence=dict(df_ratio={x["term"]: x["df_ratio"] for x in low},
+                                           threshold=0.5),
+                             action="换成更具体的词"))
+        if n_pos > max(int(k), 1):
+            msgs.append(dict(level="info",
+                             what=f"库里有 {n_pos} 条沾边，只细看了前 {max(int(k), 1)} 条",
+                             evidence=dict(n_positive=n_pos, k=max(int(k), 1)),
+                             action="要更多结果就加大 k"))
+        return dict(query=q, tokens=qtoks, n_tokens=len(qtoks), terms=terms,
+                    vocab=dict(V=int(bm.V), N=int(bm.N), n_active=n_active,
+                               avgdl=float(bm.avgdl)),
+                    scores=dict(k=max(int(k), 1),
+                                max=float(s.max()) if s.size else 0.0,
+                                n_positive=n_pos),
+                    status=status, messages=msgs)
+
+    def diagnose(self, q: str, k: int = 10) -> dict:
+        """诊断：为什么没搜到 / 为什么只搜到这些 —— 产品侧入口（人话 + 可举证）。
+
+        与 `explain()` 分工：`explain` 拆「某一篇为什么得分高」，`diagnose` 看「整次查询的
+        处境」（词在不在库里、沾边有多少、哪些词没区分度）。两者用同一份分数数组口径
+        （`_score_active`），不另算一遍公式。
+        """
+        with self._lock.read():
+            return self._diagnose(q, k=k)
 
     # ---------------------------------------------------------------- 写
     def add(self, root: str, *, workers: int = 0) -> dict:
@@ -196,11 +328,16 @@ class Index:
                         folded=self._z._bm.folded_report())
 
     def compact(self) -> dict:
-        """压实：把已挂段全部折进主表 ＋ 清分块缓存 → 查询恢复单块。
+        """压实：把已挂段全部折进主表 ＋ 落盘 ＋ 清分块缓存 → 查询恢复单块。
 
         查询耗时随分块数上升，长期只追加会把块数堆起来；折叠是一次 `O(nnz)`，折完只走主表。
         内核不变量 `fold_segment` 断言"折完 T 行数 == N"（`N` 含所有已挂段）→ 多段时用不了
         `fold_segment`，这里改走 `fold_all()`。
+
+        必须先 `_persist()` 再写 `folded_all` 事件（2026-10-18 修）：折叠改的是内存里的 `T`，
+        段的内容不在源语料里 ⇒ 不落盘就写提交事件，重载时 npz 里没有那些行、旁车却说"已折叠"
+        ⇒ 段内容静默丢失（`_meta` 也一起丢）。顺序落盘→提交：崩溃只留"已落盘、旁车仍说在挂"，
+        重载时 `remount_staged` 会因 `T.shape[0] > row_base` 判为已折叠而跳过 ⇒ 安全。
         """
         with self._lock.write():
             from .core import manifest_append
@@ -212,6 +349,7 @@ class Index:
                 bm._tc_blocks, bm._tc_rows = [], 0
                 bm._invalidate_w()
                 bm._recompute_stats()
+                self._z._persist()               # 先落盘（折叠改了 T 与 meta）
                 bm._ensure_tc()
                 # 折叠 = 一次提交：必须往旁车追加 `folded_all`，否则重载时旁车仍把已折的段当"在挂"。
                 manifest_append(self.dir, {"event": "folded_all", "tags": list(info["tags"]),
@@ -224,6 +362,7 @@ class Index:
             for tag in segs:
                 folded.append(dict(tag=tag, **bm.fold_segment(tag)))
             if folded:
+                self._z._persist()               # 先落盘（同上）
                 manifest_append(self.dir, {"event": "folded_all",
                                            "tags": [f["tag"] for f in folded],
                                            "via": "compact/fold_segment"})
@@ -274,16 +413,25 @@ class Index:
 
     def fuse(self, q: str, qvec, view_name: str, *, alpha: float = 0.35,
              k: int = 10) -> list[dict]:
-        """稀疏 ＋ 稠密融合打分（覆盖行分数单调不降），返回 top-k。"""
+        """稀疏 ＋ 稠密融合打分（覆盖行分数单调不降），返回 top-k。
+
+        01m（P-B）：三处换成缓存/单趟 —— ① `_active_rows()`（不再每次用 Python
+        列表推导重建行号数组：@1M 那是 70.28 ms/次 的写法）；② 行分只 gather 一次
+        （改前每返回一行都再 `s[rows[j]]` 一次）；③ `_topk_idx`（P-O3：采样定阈 → 候选内
+        `argpartition`；`TOPK_APPROX=False` 时退回整段 `argpartition`）替代
+        全量 `argsort`。并列时取哪几行本就不保证（`_topk_idx` 契约），与 `core.query`
+        口径一致；判据盯的是选出的 k 个分数值多重集逐位相同。
+        """
         with self._lock.read():
             z = self._z
             s = z._bm.fused_scores(zh_tokenize(q), qvec, view_name, alpha=alpha)
-            rows = np.asarray([c["row"] for c in z._meta], dtype=np.int64)
-            ranked = np.argsort(-s[rows])[:k]
+            rows = z._active_rows()
+            sv = s[rows]                              # 只取一次
+            ranked = _topk_idx(sv, k)
             out = []
             for i, j in enumerate(ranked, 1):
                 m = z._meta[int(j)]
-                out.append(dict(rank=i, score=float(s[rows[j]]), file=m["file"],
+                out.append(dict(rank=i, score=float(sv[j]), file=m["file"],
                                 line=m["line"], text=m["text"]))
             return out
 
@@ -344,7 +492,8 @@ def build_index(root, out: str = ".primolix_index", *, dense: bool = False,
                 model_path: str = "") -> Index:
     r"""建索引并返回门面对象。`w_cache=True` → 建库时把物化层一并落盘。
 
-    `stream` 只改建库期的分词档（`False` / `True` / `"ids"`），不改分数。
+    `stream` 只改建库峰值内存、不改分数：`False`（默认）· `True` · `"ids"`（最低档、不重分词）。
+    实测 100k 档 net 峰值 607 / 216 / 234 MB ⇒ 差 2.6–2.8×。
     """
     z = Primolix.build(root, out=out, dense=dense, model_path=model_path,
                        workers=workers, w_cache=w_cache, stream=stream)
@@ -382,16 +531,22 @@ class Stage:
     def _has(self, t: str) -> bool:
         return (t in self._t2i) if self._t2i is not None else (t in self.bm.term2idx)
 
-    def add(self, docid, text_or_tokens) -> "Stage":
-        """加入一篇：文本（分词一次）或已分好的 token 列表。返回 `self`（可链式）。"""
-        toks = (zh_tokenize(text_or_tokens) if isinstance(text_or_tokens, str)
-                else list(text_or_tokens))
+    def add(self, docid, text_or_tokens, *, file=None, line=None) -> "Stage":
+        """加入一篇：文本（分词一次）或已分好的 token 列表。返回 `self`（可链式）。
+
+        `file` / `line` 可选：段发布时它们会进段级文档身份侧车（`.segments/<tag>/docs.jsonl`），
+        从而在产品层 `search`/`browse` 可见。缺省时用 `docid` 当 `file`、`line=1`（不编造路径）。
+        `text` 记原文（传 token 列表时退化为空格连接，会丢失原文间距）。
+        """
+        raw = text_or_tokens
+        toks = (zh_tokenize(raw) if isinstance(raw, str) else list(raw))
         for t in toks:
             if self._has(t) or t in self._new_pos:
                 continue
             self._new_pos[t] = self.base_V + len(self._new_terms)
             self._new_terms.append(t)
-        self._rows.append((docid, toks))
+        self._rows.append((docid, toks, file, line,
+                           raw if isinstance(raw, str) else " ".join(toks)))
         return self
 
     def add_many(self, pairs) -> "Stage":
@@ -409,7 +564,7 @@ class Stage:
 
     def stats(self) -> dict:
         r = self.report()
-        r["tokens_pending"] = int(sum(len(t) for _, t in self._rows))
+        r["tokens_pending"] = int(sum(len(t) for _, t, _f, _l, _x in self._rows))
         return r
 
     def abort(self) -> dict:
@@ -427,7 +582,7 @@ class Stage:
         """
         if not self._rows:
             raise RuntimeError("空批次：没有任何文档可发布（先 `add()`）")
-        from .core import SEG_SUBDIR, manifest_append
+        from .core import SEG_DOCS, SEG_SUBDIR, manifest_append
         idx, bm = self.idx, self.bm
         with idx._lock.write():
             if len(bm.idx2term) != self.base_V:
@@ -440,7 +595,7 @@ class Stage:
             seg_dir = Path(idx.dir) / SEG_SUBDIR / str(self.tag)
             seg_dir.mkdir(parents=True, exist_ok=True)
             ri, ci, da = [], [], []
-            for i, (_docid, toks) in enumerate(self._rows):
+            for i, (_docid, toks, _f, _l, _x) in enumerate(self._rows):
                 for t, c in Counter(toks).items():
                     col = self._t2i.get(t) if self._t2i is not None else bm.term2idx.get(t)
                     if col is None:
@@ -454,15 +609,25 @@ class Stage:
             np.save(seg_dir / f"{self.tag}.data.npy", np.asarray(csc.data, np.float32))
             np.save(seg_dir / f"{self.tag}.idx.npy", np.asarray(csc.indices, np.int32))
             np.save(seg_dir / f"{self.tag}.ptr.npy", np.asarray(csc.indptr, np.int32))
-            dl = np.asarray([len(t) for _, t in self._rows], np.float32)
+            dl = np.asarray([len(t) for _, t, _f, _l, _x in self._rows], np.float32)
             np.save(seg_dir / "dl.npy", dl)
+            # 乙档：文档身份侧车先写好（沿用「段文件 → 侧车 → manifest 提交 → 挂段」）
+            row_base = int(bm.N)
+            with open(seg_dir / SEG_DOCS, "w", encoding="utf-8", newline="\n") as _fh:
+                for i, (_docid, _t, _f, _l, _x) in enumerate(self._rows):
+                    _d = str(_docid)
+                    _fh.write(json.dumps(dict(docid=_d, row=row_base + i,
+                                              file=(_f or _d), line=int(_l or 1),
+                                              text=_x), ensure_ascii=False) + "\n")
             rec = dict(event="publish", tag=self.tag, generation=self.generation,
-                       rows=len(self._rows), row_base=int(bm.N), base_V=V0, m_new=M,
+                       rows=len(self._rows), row_base=row_base, base_V=V0, m_new=M,
                        new_terms=list(self._new_terms), created=time.time(),
-                       seg_dir=f"{SEG_SUBDIR}/{self.tag}")
+                       seg_dir=f"{SEG_SUBDIR}/{self.tag}", docs=SEG_DOCS)
             manifest_append(idx.dir, rec)            # 提交点（append-only）
             info = bm.mount_segment(str(seg_dir), str(self.tag), list(self._new_terms), dl,
                                     rows=len(self._rows), generation=self.generation)
+            # 乙档：立刻把段内文档补进产品层 `_meta`（否则本进程内 `search` 看不到它们）
+            absorbed = idx._z._absorb_staged([dict(tag=str(self.tag), mounted=True)])
             folded = None
             if fold:
                 folded = bm.fold_segment(str(self.tag))
@@ -471,4 +636,5 @@ class Stage:
             idx._stages.discard(self)
             self._rows, self._new_terms, self._new_pos = [], [], {}
             return dict(tag=self.tag, rows=rec["rows"], V0=V0, V1=V0 + M,
-                        N=int(bm.N), V=int(bm.V), mounted=info, folded=folded)
+                        N=int(bm.N), V=int(bm.V), mounted=info, folded=folded,
+                        meta_added=int(absorbed.get("added", 0)))

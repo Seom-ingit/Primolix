@@ -2,7 +2,48 @@
 
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## 0.1.0 — 尚未发布（首个版本）
+## 0.2.0 — 2026-11-08
+
+三件事：**回答"为什么没搜到"**、**把选择段从 N 长全排压成采样定阈**、**把写路径的向量化档公开**。
+索引格式不变（仍是 `primolix-bm25-v3`），**升级不需要重建**。
+
+- **新增 `Index.diagnose(q, k=10)`**：`status` 取 `ok` / `partial_oov` / `all_oov` / `no_positive` / `no_tokens`，
+  逐词给 `in_vocab` / `df` / `df_ratio` / `idf`，并给一组人话 `messages`（每条都可举证，不是套话）。
+  CLI：`python -m primolix diagnose "你的查询"`。
+- **`explain()` 补两处此前答不了的问题**（默认行为不变，仍返回 `list`）：
+  ① 词表外（OOV）词不再被静默跳过 —— 以 `status='oov'`、`in_vocab=False`、`contribution=0.0` 出现在结果里，
+  且**不受 `top` 截断**；`status` 取 `ok` / `oov` / `no_tf` / `unavailable`（`unavailable` 的 `contribution` 是
+  `None`，不拿 0 冒充）。② `explain(..., diagnose=True)` 返回 `dict(contributions=..., diagnosis=...)`，
+  没搜到时不再只有一张空表。`docid` 不在 top-k 时改为**全库查找**（真不存在才 `KeyError`）。
+- **近似 top-k 默认开启**（`TOPK_APPROX=True` · `TOPK_FRAC=32` · `TOPK_SHRINK=0.98`）：选择段改成
+  「1/32 采样定阈 → 只对候选选 k」。**1M 索引 · k=10 · 200 查询 · ABBA 4 轮**：端到端 p50 **5.92 → 2.81 ms**
+  （配对 0.484 · 200/200 胜）；同批 k=100 **6.03 → 2.75 ms**（199/200）。质量面：**6,980 查询**上
+  `R@10 0.4467` / `MRR@10 0.2794` **两臂未舍入逐位相同**，分数违规 0/6,980，文档序列不同 73/6,980
+  且**不涉及任何 gold**。非浮点 / 非正分布 / 正分不足 k 时**自动回精确路径**；要完全确定的行为把
+  `primolix.core.TOPK_APPROX` 置 `False`，`primolix.core.topk_stats()` 可回读两臂各自真的走了哪条。
+- **新增 `primolix.span`**（meta 层定位，**不进打分链路**）：`hit_span(text, query)` 给最小覆盖跨度
+  （整串优先）、`hit_ranges(text, tokens)` 给每个词的全部出现区间、`query_tokens(q)` 与前端
+  `lib/span.ts` 同款切分口径（纯子串匹配，可与前端逐行对拍）。
+  `stage_begin().add(docid, text, file=..., line=...)` 可给段内文档补真实路径与行号
+  （缺省用 `docid` 当 `file`、`line=1`，不编造路径）。
+- **内核新增 `WRITE_VEC`（默认关）**：`append_docs` 的向量化写路径，与 legacy 逐位等价
+  （`T` / `df` / `dl` / 分数全等，`max|Δ| = 0`）。写单价**按形态两报**：重复批 **0.34–0.64 µs/posting**
+  （载体在岗 K=100 时 9.5×，K=5000 时 16.0×）；但"整批只 append 一次"的形态**反而慢**
+  （33.2 vs 23.2 ms —— 一次性建表 ≈31 ms @V=63,314）。默认关，按形态自己决定。
+- 建库分词档 `stream` 可显式取 `off` / `on` / `ids`（非法值报错，不静默回落），并随索引落盘
+  （`stream_mode`，旧索引无此字段按 `off`）。
+- 测试：内核单元 **23 → 26 项**（U24 近似 top-k「两臂自证 + 分数多重集」、U25 `WRITE_VEC` 逐位等价、
+  U26 `span` 契约），端到端 **9 → 10 项**（诊断 / OOV 契约）。
+
+### 已知边界（本版新增）
+
+- 近似 top-k 是**概率**保证而非证明：正分文档极少或大量并列时走有界退化档，最坏回精确路径（≈基线）。
+  已测：1M 中文、`k ∈ {10,100,1000}`、`frac ∈ {16,32}`；**未测** 8.84M、dense 分支（`k*10` 那跳）、
+  短查询 / 高重复分布。
+- `WRITE_VEC` 默认关；一次性建表成本会让"只写一次"的形态变慢，所以它不是无条件更快。
+- `span` 是纯子串口径，不做分词级定位；`chunk` 截断仍是 `MAX_CHUNK=1200` 字符窗口（截断本身不新增标记）。
+
+## 0.1.0 — 2026-10-04（首个对外版本）
 
 - **新增"段式发布"**：`stage_begin() / add / add_many / stats / publish / abort` —— 在线新增先攒成一批、
   一批只发布一次（挂只读段），发布对并发查询原子；`compact()` 折回主表，`save(fold_first=True)` 先折后写。
@@ -14,10 +55,6 @@
   （不再"发布一次、整层重算一次"）。
 - **词表载体新增世代键** `bm25.npz.vocab/vocab_key.txt`：载体与 `bm25.npz` 不同代、缺键或长度不符时
   **拒用载体**、回落到 npz 自带的词表（此前在"就地重存失败"时会静默用到旧载体、丢掉新词）。
-- **建库分词档可选、并随索引落盘**：`build(..., stream=...)`，命令行 `index --stream {off,on,ids}`。
-  它只改建库期是否驻留分词结果（`off` 分词一次并缓存、`on` 两遍不驻留、`ids` 分词一次即转 id），
-  **不改分数**（三档逐位一致）。该选择写进 `bm25.npz` 的 `stream_mode`，重载后由表外词触发的
-  整库重建继续用它；旧索引无此字段时按 `off` 处理。
 
 首个对外版本。相对上一代 `ZELIX` 内核，这一版的重点是**索引生命周期**。
 

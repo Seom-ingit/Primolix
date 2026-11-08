@@ -329,12 +329,60 @@ def _cmd_compact(args):
     _show_json(_idx(args).compact())
 
 
+def _fmt_diag(d):
+    """把 `diagnose()` 的结果打成人话（产品侧入口；JSON 走 `--json`）。"""
+    print(f"查询 {d['query']!r} 的处境（{d['n_tokens']} 个词，库 {d['vocab']['N']} 篇 / "
+          f"词表 {d['vocab']['V']}）：")
+    label = {"ok": "正常", "partial_oov": "部分词不在库里", "all_oov": "全部词都不在库里",
+             "no_positive": "词在库里但没有一篇同时命中", "no_tokens": "查询里没有可用内容"}
+    print(f"  状态：{label.get(d['status'], d['status'])}（{d['status']}）")
+    for t in d["terms"]:
+        if t["in_vocab"]:
+            print(f"    {t['term']:<16} 库里 {t['df']:>6d} 篇（占比 {t['df_ratio']:.1%}）"
+                  f"  idf={t['idf']:.3f}")
+        else:
+            print(f"    {t['term']:<16} 不在词表")
+    for m in d["messages"]:
+        mark = {"warn": "", "info": "ℹ"}.get(m["level"], "·")
+        print(f"  {mark} {m['what']}")
+        if m.get("action"):
+            print(f"     → {m['action']}")
+    print(f"  分数：max={d['scores']['max']:.4f} · 沾边 {d['scores']['n_positive']} 篇 · 只看了前 {d['scores']['k']}")
+
+
+def _cmd_diagnose(args):
+    d = _idx(args).diagnose(args.q, k=args.k)
+    if args.json:
+        _show_json(d)
+    else:
+        _fmt_diag(d)
+
+
 def _cmd_explain(args):
-    rows = _idx(args).explain(args.q, docid=args.docid, k=args.k or 1)
-    print(f"查询 {args.q!r} 的逐词贡献（{len(rows)} 项）：")
+    idx = _idx(args)
+    d = idx.diagnose(args.q, k=10)     # 诊断按「用户通常看前 10 条」的口径，不跟 `--k`（那是拆第几名）
+    if args.json:
+        _show_json(d)
+        return
+    if d["status"] != "ok" or d["scores"]["n_positive"] == 0:
+        # 没搜到 / 有词不在库里 → 先讲处境，再谈贡献（否则用户只看到一张空表）
+        _fmt_diag(d)
+    rows = idx.explain(args.q, docid=args.docid, k=args.k)
+    if not rows:
+        print("（没有可拆的文档：先看上面为什么没搜到）")
+        return
+    total = sum(r["contribution"] or 0.0 for r in rows)
+    print(f"查询 {args.q!r} 的逐词贡献（{len(rows)} 项 · 合计 {total:.4f}）：")
     for r in rows:
-        print(f"  {r['term']:<14} tf={r['tf']:>5.1f}  df={r['df']:>7.0f}  "
-              f"idf={r['idf']:6.3f}  贡献={r['contribution']:9.4f}")
+        if r["status"] == "oov":
+            print(f"  {r['term']:<14} 不在词表（这个词你的库里没有，贡献 0）")
+        elif r["status"] == "no_tf":
+            print(f"  {r['term']:<14} 这篇里没有这个词（贡献 0，但不是它拉低了你）")
+        elif r["status"] == "unavailable":
+            print(f"  {r['term']:<14} tf 取不到（段布局异常，贡献未知）")
+        else:
+            print(f"  {r['term']:<14} tf={r['tf']:>5.1f}  df={r['df']:>7.0f}  "
+                  f"idf={r['idf']:6.3f}  贡献={r['contribution']:9.4f}")
 
 
 def main(argv=None):
@@ -410,11 +458,17 @@ def main(argv=None):
     sp.add_argument('q', nargs='?', default=None)
     sp = sub.add_parser('compact', help='压实：把已挂段并进主表（查询恢复单块）')
     sp.add_argument('--out', default=None)
-    sp = sub.add_parser('explain', help='归因：把分数按词拆开')
+    sp = sub.add_parser('explain', help='归因：把分数按词拆开（没搜到时先讲为什么）')
     sp.add_argument('q')
     sp.add_argument('--out', default=None)
     sp.add_argument('--k', type=int, default=1, help='拆第 k 名（默认第 1 名）')
-    sp.add_argument('--docid', default=None, help='按文件名片段指定文档')
+    sp.add_argument('--docid', default=None, help='按文件名片段指定文档（全库找）')
+    sp.add_argument('--json', action='store_true', help='输出诊断 JSON 而不是逐词表')
+    sp = sub.add_parser('diagnose', help='诊断：为什么没搜到 / 为什么只有这些（人话）')
+    sp.add_argument('q')
+    sp.add_argument('--out', default=None)
+    sp.add_argument('--k', type=int, default=10)
+    sp.add_argument('--json', action='store_true')
     args = ap.parse_args(argv)
     if args.cmd == 'index':
         _cmd_index(args)
@@ -440,6 +494,8 @@ def main(argv=None):
         _cmd_compact(args)
     elif args.cmd == 'explain':
         _cmd_explain(args)
+    elif args.cmd == 'diagnose':
+        _cmd_diagnose(args)
     else:
         ap.print_help()
         return 1

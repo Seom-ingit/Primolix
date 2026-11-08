@@ -28,6 +28,9 @@ Checks (each prints PASS/FAIL; process exits 1 if anything fails):
   U21 appending in place while a segment is mounted is refused loudly (it overlaps the segment's rows)
   U22 saving while a segment is mounted is refused loudly; `fold_all()` makes it durable, reload stays bit-exact (no double counting)
   U23 the build-time tokenization mode is persisted; an absent field means off (old indexes)
+  U24 approximate top-k (TOPK_APPROX): score multiset == the exact path; both arms really ran their own branch
+  U25 WRITE_VEC (vectorised append) == the legacy append, bit-exact arrays
+  U26 span.hit_span: whole-string first, minimal multi-term cover, None when nothing matches
 
   Not covered here: the view family (see docs/api.md).
 """
@@ -578,6 +581,73 @@ check("U23 建库分词档随索引落盘；缺字段按 off（旧索引兼容�
       and getattr(_bm23c, "stream_mode", None) == "off",
       f"建库={getattr(_bm23, 'stream_mode', None)!r} · 重载={getattr(_bm23b, 'stream_mode', None)!r}"
       f" · 缺字段={getattr(_bm23c, 'stream_mode', None)!r}")
+
+# ------------------------- U24 近似 top-k：分数多重集 == 精确路径；两臂各自真走过自己的分支
+from primolix import core as _core                                # noqa: E402
+
+_rng = np.random.default_rng(20261019)
+_x = np.zeros(5000, dtype=np.float32)
+_pos = _rng.choice(5000, size=300, replace=False)
+_x[_pos] = (_rng.random(300) + 0.5).astype(np.float32)            # 300 个正分，其余 0
+_core.topk_stats(reset=True)
+_iA = _core._topk_idx(_x, 10)
+_stA = _core.topk_stats()                                         # 累计：calls=1 / approx=1
+_old_approx = _core.TOPK_APPROX
+try:
+    _core.TOPK_APPROX = False                                     # 一开关回退（发布承诺的可回退点）
+    _iB = _core._topk_idx(_x, 10)
+    _stB = _core.topk_stats()                                     # 累计：calls=2 / exact=1
+finally:
+    _core.TOPK_APPROX = _old_approx
+_same24 = np.array_equal(np.sort(_x[_iA]), np.sort(_x[_iB]))
+check("U24 近似 top-k 的分数多重集 == 精确路径；两臂各自真走过自己的分支",
+      _same24 and _stA["calls"] == 1 and _stA["approx"] == 1 and _stA["exact"] == 0
+      and _stB["calls"] == 2 and _stB["exact"] == 1,
+      f"A(approx) calls={_stA['calls']} approx={_stA['approx']} exact={_stA['exact']}"
+      f" · B(exact) calls={_stB['calls']} exact={_stB['exact']}"
+      f" · 多重集相同={_same24}")
+
+# ------------------------- U25 WRITE_VEC（批量向量化写）与 legacy 路径逐位等价
+EXTRA = ["sparse sparse kernel appended row",                   # 同词重复 ⇒ tf 计数
+         "celery soup brand new row",                            # 词表内新行
+         "qwxzvzz qqqvvv"]                                       # 全表外 ⇒ dl>0 但 0 posting
+_bmA = SparseBM25(list(DOCS), tok)
+_bmB = SparseBM25(list(DOCS), tok)
+_old_wv = SparseBM25.WRITE_VEC
+try:
+    SparseBM25.WRITE_VEC = True
+    _bmB.append_docs([tok(d) for d in EXTRA])                     # 向量化路径
+finally:
+    SparseBM25.WRITE_VEC = _old_wv
+_bmA.append_docs([tok(d) for d in EXTRA])                         # legacy 路径
+_TA, _TB = _bmA.T, _bmB.T
+_d25 = max(float(np.abs(np.asarray(_bmA.dl, dtype=np.float32)
+                        - np.asarray(_bmB.dl, dtype=np.float32)).max()), 0.0)
+_ds25 = 0.0
+for _q in QUERIES:
+    _sa = np.asarray(_bmA.score_all(_q), dtype=np.float32)
+    _sb = np.asarray(_bmB.score_all(_q), dtype=np.float32)
+    _ds25 = max(_ds25, float(np.abs(_sa - _sb).max()) if _sa.shape == _sb.shape else float("nan"))
+check("U25 WRITE_VEC 与 legacy 追加逐位等价（T/df/dl/N 全等，分数 max|d|=0）",
+      np.array_equal(_TA.indptr, _TB.indptr) and np.array_equal(_TA.indices, _TB.indices)
+      and np.array_equal(_TA.data, _TB.data)
+      and np.array_equal(_bmA.df, _bmB.df) and _d25 == 0.0 and _ds25 == 0.0
+      and int(_bmA.N) == int(_bmB.N),
+      f"nnz={int(_TA.data.size)}·{int(_TB.data.size)} · df/dl 一致={np.array_equal(_bmA.df, _bmB.df)}/{_d25 == 0.0}"
+      f" · 分数 max|d|={_ds25:.3e} · N={int(_bmA.N)}·{int(_bmB.N)}")
+
+# ------------------------- U26 span 模块：最小覆盖跨度（meta 层，纯子串口径）
+from primolix.span import hit_span, query_tokens                  # noqa: E402
+
+_txt = "真增量写入：改一篇文档只做那一篇的工作"
+_p26 = _txt.find("只做")
+check("U26 span.hit_span 整串优先 / 多词取最小覆盖 / 无命中返回 None",
+      hit_span(_txt, "真增量写入") == (0, 5)
+      and hit_span(_txt, "只做那一篇") == (_p26, _p26 + 5)
+      and hit_span(_txt, "qwxzvzz") is None
+      and query_tokens("a，b、c") == ["a", "b", "c"],
+      f"整串={hit_span(_txt, '真增量写入')} · 词={hit_span(_txt, '只做那一篇')}"
+      f" · 无命中={hit_span(_txt, 'qwxzvzz')} · tokens={query_tokens('a，b、c')}")
 
 print("-" * 60)
 print("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS))

@@ -4,6 +4,7 @@
 import hashlib
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -34,6 +35,27 @@ MAX_FILE_BYTES = 2_000_000
 # 模型缓存: 进程内只加载一次 dense 模型
 _MODEL_CACHE = {}
 
+# 01m（P-D）：`_topk_idx` 的取负缓冲 —— 线程私有（共享会在并发查询下互相污染）
+_NEG_BUF = threading.local()
+
+#   `TOPK_APPROX=False` ⇒ 逐位回到改动前的精确 `argpartition`（回退用，须与旧行为逐位一致）。
+#   `TOPK_FRAC` 是采样步长（1/32）；`TOPK_SHRINK` 是阈值余量（采样第 k 大 × 0.98）。
+TOPK_APPROX = True
+TOPK_FRAC = 32
+TOPK_SHRINK = 0.98
+_TOPK_STAT = threading.local()
+
+
+def topk_stats(reset=False):
+    """本线程 `_topk_idx` 的路径计数（用于"两臂都真的动过"的准入自证）。"""
+    d = getattr(_TOPK_STAT, "d", None)
+    if d is None:
+        d = _TOPK_STAT.d = dict(calls=0, approx=0, exact=0, fallback=0, cand=0)
+    out = dict(d)
+    if reset:
+        for key in d:
+            d[key] = 0
+    return out
 
 
 # ------------------------------------------------------------------ 输出
@@ -188,21 +210,93 @@ def _norm_stream(v):
     return "ids" if v == "ids" else bool(v)
 
 
+def _topk_exact(x, k):
+    """精确路径（改动前的原实现）：N 长取负 + 一遍 `argpartition`。
+
+    调用前必须已保证 `0 < k < x.size`。返回 k 个下标（分数降序、并列按下标升序）。
+    """
+    n = int(x.size)
+    buf = getattr(_NEG_BUF, "arr", None)
+    if buf is None or buf.size < n or buf.dtype != x.dtype:
+        buf = np.empty(n, dtype=x.dtype)
+        _NEG_BUF.arr = buf
+    neg = np.negative(x, out=buf[:n])                     # 复用 ⇒ 无 N 长临时
+    idx = np.argpartition(neg, k - 1)[:k].astype(np.int64, copy=False)
+    return idx[np.lexsort((idx, -x[idx]))]
+
+
+def _topk_sample(x, n, k, st):
+    """P-O3 近似路径：1/`TOPK_FRAC` 采样定阈 → `flatnonzero` → 只对候选选 k。
+
+    返回 `None` 表示"本形态不适合近似"（交回精确路径，退化有界）：
+      · 非浮点 / 非正分布（全零、全负）—— `_topk_idx` 的通用契约；
+      · 正分文档数 < k（命中文档极少的查询）。
+    这是概率性保证：阈值 = 采样第 k 大 × `TOPK_SHRINK`，理论上可能高于真第 k 大
+      ⇒ 漏掉边界文档。经验面（1M · 200 查询 · k∈{10,100,1000} · frac∈{16,32}）：
+      分数多重集 0 违规、候选覆盖 100%。
+    """
+    if x.dtype.kind != "f":
+        return None
+    if not (float(x.max()) > 0.0):
+        return None
+    f = int(TOPK_FRAC)
+    lim = n // (4 * k + 8)                 # 采样点至少 ~4k+8 ⇒ 阈值估计不至于退化
+    if lim < f:
+        f = max(1, lim)
+    sub = x[::f]
+    m = int(sub.size)
+    kk = min(k, m - 1)
+    thr = np.partition(sub, m - kk)[m - kk] * x.dtype.type(TOPK_SHRINK)
+    if not (thr > 0):
+        # 采样第 k 大 = 0（命中文档极少）：阈值退化为 0 会把全部零分捞进候选。
+        # 改成"只要正分" ⇒ 候选 = 真正命中的文档数（天然有界）。
+        thr = x.dtype.type(np.nextafter(np.float32(0.0), np.float32(1.0)))
+    cand = np.flatnonzero(x >= thr)
+    if cand.size < k:                      # 有界退化 1：降阈到"只要正分"
+        cand = np.flatnonzero(x > 0)
+        if cand.size < k:                  # 有界退化 2：回精确（最坏 ≈ 基线）
+            st["fallback"] += 1
+            return None
+    st["cand"] += int(cand.size)
+    sub2 = x[cand]
+    j = np.argpartition(-sub2, k - 1)[:k]
+    idx = cand[j].astype(np.int64, copy=False)
+    st["approx"] += 1
+    return idx[np.lexsort((idx, -x[idx]))]
+
+
 def _topk_idx(x, k):
     r"""取前 k 大的下标 (分数降序; 并列按下标升序)。
 
-    用 `argpartition` 而非 `argsort`: 只要前 k 个, 不必全排序。
-    返回的分数值与原全量排序相同 (并列时取哪些行号本就不保证)。
+    P-O3（2026-10-19）：默认走「采样定阈」（`TOPK_APPROX=True`）——
+    选择段 @1M 由 4.93 ms → 0.57 ms（配对 0.138，600/600 全胜）。做法：
+    1/32 抽样估第 k 大 × 0.98 当阈值 → `flatnonzero` 取候选 → 只对候选 `argpartition`。
+    不改返回契约：仍是"k 个下标、分数降序、值等于全量排序的前 k 个"。
+
+    非正分布 / 正分不足 k / 非浮点 ⇒ 自动回精确路径（`TOPK_APPROX=False` 亦然）。
+    近似性是概率保证而非证明；实测口径见 docs/api.md 第 5 节 #12。
+    κ 很大（如 dense 分支的 `k*10`）时采样点相对 k 变少 ⇒ 收益收窄、退化档变多。
+
+    01m（P-D）：精确路径的取负那一步写进线程私有常驻缓冲，免掉每次调用分配的
+    N 长临时（@1M ≈4 MB/查询、@8.84M ≈35 MB/查询）。必须线程私有：共享缓冲在
+    两个并发查询下会互相污染（本层的锁只保护索引结构，不保护这条快路径）。
     """
     n = int(x.size)
     k = int(min(max(k, 0), n))
     if k <= 0:
         return np.zeros(0, dtype=np.int64)
     if k >= n:
-        idx = np.arange(n, dtype=np.int64)
-    else:
-        idx = np.argpartition(-x, k - 1)[:k].astype(np.int64, copy=False)
-    return idx[np.lexsort((idx, -x[idx]))]
+        return np.arange(n, dtype=np.int64)
+    d = getattr(_TOPK_STAT, "d", None)
+    if d is None:
+        d = _TOPK_STAT.d = dict(calls=0, approx=0, exact=0, fallback=0, cand=0)
+    d["calls"] += 1
+    if TOPK_APPROX:
+        idx = _topk_sample(x, n, k, d)
+        if idx is not None:
+            return idx
+    d["exact"] += 1
+    return _topk_exact(x, k)
 
 
 class Primolix:
@@ -218,6 +312,7 @@ class Primolix:
         self._bm = None
         self._meta = None
         self._rows = None          # 活跃 chunk 的物理行号缓存 (每个 `self._meta =` 点置 None)
+        self._rows_ident = None    # 01m：`(rows 对象, 是否恒等)` —— 见 `_active_rows`
         self._hashes = None
         self._vecs = None
         self._dense = dense
@@ -305,8 +400,56 @@ class Primolix:
                 _skip = [r for r in _rm if not r.get("mounted")]
                 _say(f"[staged] 按旁车重挂 {len(_ok)} 个段"
                      + (f" · 跳过 {len(_skip)}（{_skip[0].get('reason', '')[:60]}）" if _skip else ""))
+                # 乙档：把已挂段里的文档身份补回 `_meta`（否则段内文档在产品层不可见）
+                _ab = self._absorb_staged(_ok)
+                if _ab["added"]:
+                    _say(f"[staged] 已把 {_ab['added']} 篇段内文档补回 `_meta`"
+                         f"（产品层可见；跳过 {_ab['skipped']}）")
         except Exception as _e:                                      # noqa: BLE001
             _say(f"[警告] 旁车重挂失败（{_e!r}）→ 该索引按 npz 状态可用，但已发布的段未挂上")
+
+    def _absorb_staged(self, mounted) -> dict:
+        r"""把已挂段里的文档身份补回 `self._meta`（乙档：产品层可见性的唯一写入方）。
+
+        行号以实际挂载位置为准（`bm._segments[tag]['row_base']`），不信侧车里记的
+        `row` —— `reset`/多次重挂之后同一段的行号可能与发布时不同。
+        幂等（按物理行去重）：`save()` 在段在场时直接抛错（`kernel.py` 的 `save`），
+        所以"`_meta` 已有、段又挂上"的结构性来源不存在；去重是为将来放宽留的保险。
+        `_vecs` 与 `_meta` 逐位对齐 ⇒ 追加后长度不符就必须弃用 dense并如实告警。
+        """
+        added = skipped = 0
+        have = {int(m.get("row", -1)) for m in (self._meta or [])}
+        segs = getattr(self._bm, "_segments", None) or {}
+        for r in mounted or []:
+            if not r.get("mounted"):
+                continue
+            tag = r.get("tag")
+            info = segs.get(tag) or {}
+            rb = int(info.get("row_base", -1))
+            docs = load_seg_docs(self.dir, tag)
+            if rb < 0 or not docs:
+                skipped += len(docs)
+                _say(f"[staged] 段 {tag} 没有文档身份侧车（{SEG_DOCS}）"
+                     f"→ 该段 {info.get('rows', '?')} 行在产品层不可见（如实降级，不猜身份）")
+                continue
+            for i, d in enumerate(docs):
+                row = rb + i
+                if row in have:
+                    continue
+                docid = str(d.get("docid", f"seg:{tag}:{i}"))
+                self._meta.append(dict(docid=docid, row=row,
+                                       file=d.get("file") or docid,
+                                       line=int(d.get("line") or 1),
+                                       text=d.get("text") or ""))
+                have.add(row)
+                added += 1
+        if added:
+            self._rows = None            # 失效行号缓存（新数组对象 ⇒ 恒等判定自动作废）
+            if self._vecs is not None and len(self._vecs) != len(self._meta):
+                self._vecs = None
+                _say("[警告] 段内文档已并入 `_meta`，但 dense 向量数不匹配 → 本次忽略 dense"
+                     "（重编码后可恢复）")
+        return dict(added=added, skipped=skipped)
 
     def _encode_dense(self):
         try:
@@ -351,14 +494,36 @@ class Primolix:
             n = len(self._meta)
             self._rows = (np.fromiter((c['row'] for c in self._meta), dtype=np.int64, count=n)
                           if n else np.zeros(0, dtype=np.int64))
+            # 01m：顺手判「恒等」（`_meta` 的行号恰是 `0..N-1` 且与物理行一一对应）。
+            #    判一次 O(n)（只在这条缓存重建时付）；此后 `_score_active` 每查询免掉
+            #    用对象身份当失效键：六处 `self._rows = None` 的失效点都会让本函数
+            #    重建出一个新数组对象 ⇒ 这条判定自动作废，无须（也不会）漏改失效点。
+            #    失效是惰性的：`_rows = None` 之后、下一次 `_active_rows()` 之前，
+            #    生产路径满足这一点（`_score_active` 先调 `_active_rows()`，另有
+            #    `ident[0] is rows` 兜底）；外部读它前必须先自己调一次 `_active_rows()`。
+            bm = self._bm
+            ok = False
+            if n and bm is not None and n == int(bm.N):
+                ok = bool((self._rows == np.arange(n, dtype=np.int64)).all())
+            self._rows_ident = (self._rows, ok)
         return self._rows
 
     def _score_active(self, qtoks):
-        """返回与 self._meta 对齐的 BM25 分数数组（按每条 row 取物理行分）。"""
+        """返回与 `self._meta` 对齐的 BM25 分数数组（按每条 row 取物理行分）。
+
+        01m：`_meta` 行号恒等时（新建索引未删未迁的常见形态）直接返回
+        `score_all` 的数组 —— 省掉一整趟 `gather` ＋ `astype` 拷贝。
+        返回的是 `score_all` 当次新建的数组（不与任何常驻缓冲共享）⇒ 调用方可安全
+        持有；但调用方 不得就地改写它（本包内唯一调用方 `query` 只读它）。
+        """
         scores = self._bm.score_all(qtoks)
         rows = self._active_rows()
         if rows.size == 0:
             return np.zeros(0, dtype=np.float32)
+        ident = self._rows_ident
+        if (ident is not None and ident[0] is rows and ident[1]
+                and scores.size == rows.size and scores.dtype == np.float32):
+            return scores
         return scores[rows].astype(np.float32)
 
     def query(self, q, k=10, dense=False):
@@ -391,8 +556,8 @@ class Primolix:
             if s[i] <= 0:
                 break
             m = self._meta[int(i)]
-            out.append(dict(rank=rank, score=float(s[i]), file=m['file'],
-                            line=m['line'], text=m['text']))
+            out.append(dict(rank=rank, score=float(s[i]), docid=m.get('docid'),
+                            file=m['file'], line=m['line'], text=m['text']))
         return out
 
     # ---------- 浏览 ----------
@@ -407,8 +572,8 @@ class Primolix:
         else:
             idxs = list(range(len(self._meta)))
         start = page * n
-        return [dict(file=self._meta[i]['file'], line=self._meta[i]['line'],
-                     text=self._meta[i]['text'])
+        return [dict(docid=self._meta[i].get('docid'), file=self._meta[i]['file'],
+                     line=self._meta[i]['line'], text=self._meta[i]['text'])
                 for i in idxs[start:start + n]], len(idxs)
 
     def list_files(self):
@@ -484,7 +649,7 @@ class Primolix:
         for c, row in zip(append_chunks, new_rows):
             c['row'] = int(row)
         self._meta = keep_meta + append_chunks
-        self._rows = None          # 失效行号缓存
+        self._rows = None          # 失效行号缓存（行号已迁移/追加）
         self._hashes = new
         self._persist()
         # dense: update 后整库重对齐 (rows 迁移, 旧向量错位; 小语料可负担)
@@ -667,6 +832,29 @@ class Primolix:
 
 SEG_SUBDIR = ".segments"
 SEG_MANIFEST = "manifest.jsonl"
+# 段级文档身份侧车（乙档）：一行一篇 `{docid,row,file,line,text}`，与段同生共死。
+#    （写到一半崩 ⇒ 历史身份全丢）。侧车是 append-only 的，且先于 manifest 提交写好。
+SEG_DOCS = "docs.jsonl"
+
+
+def seg_docs_path(index_dir, tag) -> Path:
+    """段 `tag` 的文档身份侧车路径（与段的三个 `.npy` 同目录）。"""
+    return Path(index_dir) / SEG_SUBDIR / str(tag) / SEG_DOCS
+
+
+def load_seg_docs(index_dir, tag) -> list:
+    """读段 `tag` 的文档身份侧车；不存在/空 ⇒ `[]`（老段没有侧车，如实降级）。"""
+    p = seg_docs_path(index_dir, tag)
+    if not p.exists():
+        return []
+    out = []
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        if ln.strip():
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                break                     # 半行（写崩）⇒ 只认前缀，不猜
+    return out
 
 
 def manifest_append(index_dir, rec: dict):

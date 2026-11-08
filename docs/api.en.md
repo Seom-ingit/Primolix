@@ -119,6 +119,19 @@ bm = SparseBM25.load("idx/bm25.npz")                          # from disk (class
 `primolix.core` also exports tunable constants: `MAX_CHUNK` (1200) · `CODE_BLOCK_LINES` (80) ·
 `MAX_FILE_BYTES` (2 MB) · `EXCLUDE_DIRS` / `EXCLUDE_EXT` / `CODE_EXT` / `PROSE_EXT` (scan/chunk rules).
 
+**Selection stage (0.2.0)**: `primolix.core.TOPK_APPROX` (default `True`) · `TOPK_FRAC` (32) ·
+`TOPK_SHRINK` (0.98) · `topk_stats(reset=False)`. `topk_stats()` returns this thread's `_topk_idx`
+counters (`calls / approx / exact / fallback / cand`) — use it to **prove which branch an arm actually
+took** (if the approximate path never fired, "both arms are equal" carries no information).
+`TOPK_APPROX = False` makes it fully deterministic (exact path only).
+
+**`primolix.span` (meta-level location, not on the scoring path)**: `hit_span(text, query)` returns the
+minimal covering span `(start, end)` (a whole-string hit wins; `None` when no term matches) ·
+`hit_ranges(text, tokens)` returns every occurrence of every term · `query_tokens(q)` uses the same
+split as the frontend `lib/span.ts` (whitespace plus CJK/latin punctuation, no real tokenisation).
+The caliber is **plain substring matching**, so a caller and the frontend can be compared line by line;
+it **does not participate in BM25 scoring** and **does not change `tokenize`'s job**.
+
 ## 5. Contracts and pitfalls (measured)
 
 | # | Contract / pitfall |
@@ -134,6 +147,9 @@ bm = SparseBM25.load("idx/bm25.npz")                          # from disk (class
 | 9 | **Two id spaces** (when you bring your own corpus): a "vocabulary" file such as `vocab.json` is **not necessarily** the index's column space — **map by string through `term2idx`** and never treat external numbers as column ids. |
 | 10 | **Both the materialised layer and the shared CSC have invalidation rules.** `W_CACHE`'s key includes parameters and block structure (a parameter change, a write or a tombstone invalidates it); **`.mm/` has a generation key `mm_key.txt`** (the npz's name/mtime/size; a mismatch refuses the whole `.mm/` and falls back to the `T_data` inside the npz); `TC_SHARED`'s key covers **the main table only** (`path\|mtime\|shape\|nnz`), so only **re-saving the index, a format change, or a change of the main table's shape/nnz** stops it matching -- **mounting or unmounting a segment does not** (the shared CSC is built from the main `T`, and segment mount/unmount never touch `T`). Note that `_seg_key()` exists for a future "segments take part in sharing" design but **has no call site today** (do not assume it is active). Neither is "set once and forget" — decide up front who pays the rebuild. |
 | 11 | **Resident memory has two calibers**: `private` and `RSS` (which counts shared pages). `mmap` postings and the shared CSC make the two point in **opposite** directions — reporting either alone misleads. Say which caliber you mean; the table in the README is the **private** caliber (excluding shared pages). |
+| 12 | **Approximate top-k is a probabilistic guarantee, not an identity** (`TOPK_APPROX`, on by default since 0.2.0): the threshold is the sampled k-th largest times `TOPK_SHRINK`, so it can in theory exceed the true k-th largest and miss a boundary document. Three shapes **fall back to the exact path automatically** (non-float / non-positive distribution / fewer than k positive scores), and the old contract still holds: "k indices, scores descending, values equal to the top k of a full sort". Measured range: 1M Chinese · 6,980 queries (`R@10` / `MRR@10` bit-identical between arms) · `k in {10,100,1000}` · `frac in {16,32}`; **not measured**: 8.84M, the dense branch (`k*10`), short queries and highly repetitive distributions. For deterministic behaviour set `TOPK_APPROX = False`. |
+| 13 | **`WRITE_VEC` (vectorised writes) is off by default and only affects cost**: its output is bit-identical to the legacy path (`T`/`df`/`dl`/scores all equal), but for "one append for the whole batch" it is **slower** (the lookup table alone costs ~31 ms at V=63,314), so the write unit price must be reported **per workload shape**: repeated batches 0.34-0.64 us/posting vs a one-shot 33.2 vs 23.2 ms. Do not read it as "on means faster". |
+| 14 | **`explain()`'s `status` is the only discriminant**: `ok` / `oov` / `no_tf` / `unavailable`. **Do not infer it from `contribution == 0`** — OOV really is 0, but `no_tf` (this document has no such term) and `unavailable` (the tf is not reachable) mean different things, and for the latter `contribution` and `tf` are both `None` (**never a fake 0**). `top` only limits the **contributing** entries; the other three classes are **always returned**. |
 
 ## 6. Common tasks (shortest path)
 
@@ -202,6 +218,7 @@ idx.search("sparse retrieval", k=5)          # text in, hits out (tokenised for 
 idx.add("docs/")                             # incremental (out-of-vocabulary -> honest rebuild, kind='rebuild')
 idx.tune(k1=2.0, b=0.3)                      # change the formula: no rebuild, material untouched
 idx.explain("sparse retrieval")              # attribution: split the score per term
+idx.diagnose("sparse retrieval")             # diagnosis: why nothing matched / why only these (0.2.0)
 idx.stats()                                  # size / switches / segment count / view count
 idx.compact()                                # compaction: fold mounted segments in -> single block again
 idx.save(w_cache=True)                       # persist (optionally with the materialised layer)
@@ -211,7 +228,8 @@ idx.save(w_cache=True)                       # persist (optionally with the mate
 |---|---|
 | `open(path)` · `open_index(...)` · `build(root, out, ...)` · `build_index(...)` | entry points; `build(..., w_cache=True)` also persists the materialised layer `w` at index time |
 | **Concurrency-safe by default** | the facade holds a **reader/writer lock** (`RWLock`): `search`/`stats`/`explain`/`fuse` take the **shared** side, while `add`/`rebuild`/`tune`/the three segment stages/`compact`/view writes/`save` take the **exclusive** side -> readers run concurrently, a writer excludes readers -> **sharing one object across threads cannot return wrong scores** (basis: with no lock about **3%** (2.3%-3.7% across repeated measurements) of concurrent reads are torn, **96% of them silently wrong**) |
-| Segments | `mount(seg_dir, tag, new_terms, dl, rows=None, generation=None)` · `unmount(tag)` · `fold(tag)` · `segments()` |
+| Attribution and diagnosis | `explain(q, docid=, k=1, top=6, diagnose=False)` — `status` has four values (see section 5 #14); `diagnose=True` returns `dict(contributions=..., diagnosis=...)` while the **default still returns a `list`** (existing callers keep working) · `diagnose(q, k=10)` — `status` (`ok`/`partial_oov`/`all_oov`/`no_positive`/`no_tokens`) plus `terms` (per-term `in_vocab`/`df`/`df_ratio`/`idf`), `scores` and `messages` · for location use `primolix.span` (section 4) |
+| Segments | `mount(seg_dir, tag, new_terms, dl, rows=None, generation=None)` · `unmount(tag)` · `fold(tag)` · `segments()` · `stage_begin()` (since 0.2.0 its `add(docid, text_or_tokens, file=, line=)` can attach the real path and line number to a staged document; defaults are `docid` as `file` and `line=1`, and it **never invents a path**) |
 | Views | `views()` · `attach_view(name, vectors, positions=None, ...)` · `detach_view(name)` · `fuse(q, qvec, name, alpha=0.35)` · `save_view` / `load_views` |
 | Parameters and switches | `tune(k1=, b=, persist=)` · `stats()` (with current switch values) · `set_switches(**kw)` (class attributes, so **process-wide**) |
 | Persistence | `save(path=None, w_cache=False)`: by default it writes back into the index directory; with `path` it saves just the kernel index elsewhere |
