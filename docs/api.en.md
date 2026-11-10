@@ -30,7 +30,7 @@ z = Primolix("docs/.idx")                      # open an existing index
 | `Primolix.build(root, out='.primolix_index', dense=False, model_path='', workers=0, skip_dirs=None)` | build an index (classmethod); `dense=True` also writes `dense.npy` |
 | `Primolix(index_dir, dense=False, model_path='')` | open an index (reads from disk) |
 | `query(q, k=10, dense=False)` | search -> `[{'rank','score','file','line','text'}]`, **score descending**, truncated at `score <= 0` |
-| `update(root, workers=0)` | incremental update driven by source-file md5 -> **returns `{'kind', 'detail'}`** (see contracts in section 5) |
+| `update(root, workers=0, verify='auto')` | incremental update driven by source-file differences -> **returns `{'kind', 'detail', 'verify'}`** (see contracts in section 5). `verify` has three settings: `'auto'` (uses `'stat'` when `(size, mtime_ns)` stamps exist) / `'stat'` (metadata only, never reads content) / `'full'` (md5 every file) |
 | `rebuild_in_place(root, workers=0)` | full rebuild into the same directory (out-of-vocabulary fallback / explicit rebuild) |
 | `info` | attribute: `N` (chunks), `V`, `size_mb`, ... |
 | `browse(file=None, page=0, n=20)` | browse chunks (used by the CLI `browse` command) |
@@ -195,9 +195,12 @@ Batch online additions and publish them **once** per batch -- the intended mode 
 - `idx.compact()` folds segments into the main table (queries return to a single block);
   `idx.save(fold_first=True)` folds first and then persists. The segments and their sidecar directory
   `<index dir>/.segments/` can be deleted safely; the only cost is re-publishing those batches.
-- Why not `idx.add()`: `add()` is **in place** and is refused while a segment is mounted (the appended
-  rows would overlap the segment's logical rows). Use `stage_begin()`, or `compact()` first.
-  **Pure deletions are unaffected.**
+- Why `idx.add()` is not a drop-in replacement: `add()` is **in place** and, **before 0.2.1, was refused**
+  while a segment was mounted (the appended rows would overlap the segment's logical rows).
+  **Since 0.2.1 it folds the mounted segments back into the main table first** (the `compact()` step) and
+  then appends; the fold cost is reported in the returned `folded_tags`. Deleting without folding would
+  leave the tombstone unpersisted (`save()` refuses while a segment is mounted) and the document would
+  **come back after a reload**. **Pure deletions are unaffected.**
 - Segments do not take part in the materialised layer (`W_CACHE`): queries inside a batch use the
   computed path, and the first query after a fold rebuilds the layer once. Shorter batches, less recompute.
 

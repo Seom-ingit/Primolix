@@ -255,15 +255,16 @@ class Index:
             return self._diagnose(q, k=k)
 
     # ---------------------------------------------------------------- 写
-    def add(self, root: str, *, workers: int = 0) -> dict:
+    def add(self, root: str, *, workers: int = 0, verify: str = "auto") -> dict:
         """增量：只处理改动过的文件，走 `Primolix.update()` 的路由（见 `04c` 判据件）。
 
         四个出口（`kind`）：`noop` / `incremental` / `staged` / `rebuild`。
-        段在场时：含新词 → 还能再挂一段（`staged`）；词表内 → 路由直接拒绝并提示
-        `compact()`（就地追加会与段的逻辑行重叠 → 静默错分）。
+        `verify`：`"auto"`（默认，有 size/mtime 印记走 stat 快扫）/ `"stat"` / `"full"`；
+        返回里带 `verify`，如实说明这一批校验到了什么程度。
+        段在场时：含新词 → 还能再挂一段（`staged`）；词表内 → 先自动折叠再增量。
         """
         with self._lock.write():
-            return self._z.update(root, workers=workers)
+            return self._z.update(root, workers=workers, verify=verify)
 
     def rebuild(self, root: str, *, workers: int = 0, force: bool = False) -> dict:
         """整库重建到同一目录（词表外回退 / 显式重建）。

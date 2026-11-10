@@ -11,6 +11,8 @@ Checks (each prints PASS/FAIL; process exits 1 if anything fails):
   T4 two batches, each adding new terms, both remount after a reload (bit-exact)
   T5 save(fold_first=True) folds and persists; a reload is bit-exact with no segments left
   T6 an unavailable segment is reported honestly on remount (never silently skipped)
+  T7 W_CACHE x batch: no w inside the batch; one rebuild at the batch end
+  T8 L1: compact_segments(persist=False) leaves npz untouched; one save converges bit-exact
 
 Not covered here: multi-process behaviour (see research/xproc_publish_probe.py).
 """
@@ -202,6 +204,35 @@ except Exception as _e:                                       # noqa: BLE001
           f"raised {type(_e).__name__}: {str(_e)[:90]}")
 finally:
     K.SparseBM25.W_CACHE = False
+
+# ---------------------------------------------------------------- T8 L1：折叠只改内存
+# 0.2.2（L1）：`compact_segments(persist=False)` 只折内存 —— 盘上 npz 必须**一个字节不动**，
+# 分数逐位不变（折叠在语义上是 no-op），随后一次 `save()` 收敛，重载后段不再存在且分数不变。
+try:
+    import os as _os
+    _l1 = primolix.open(str(IDX))
+    _st8 = _l1.stage_begin("l1")
+    _st8.add("l1a", long_("l1novelterm alpha beta"))
+    _st8.publish()
+    _npz = IDX / "bm25.npz"
+    _m0 = (_npz.stat().st_size, _npz.stat().st_mtime_ns)
+    _b8 = [np.asarray(_l1.bm.score_all(q), dtype=np.float32) for q in QS]
+    _out8 = _l1._z.compact_segments(persist=False)
+    _m1 = (_npz.stat().st_size, _npz.stat().st_mtime_ns)
+    _a8 = [np.asarray(_l1.bm.score_all(q), dtype=np.float32) for q in QS]
+    _d8a = max(float(np.abs(a - b).max()) for a, b in zip(_b8, _a8))
+    _l1.save()                                   # 一次落盘即收敛
+    _l1b = primolix.open(str(IDX))
+    _c8 = [np.asarray(_l1b.bm.score_all(q), dtype=np.float32) for q in QS]
+    _d8b = max(float(np.abs(a - b).max()) for a, b in zip(_b8, _c8))
+    check("T8 L1: fold without persist leaves npz untouched; one save converges (bit-exact)",
+          _m0 == _m1 and _d8a == 0.0 and _d8b == 0.0
+          and len(_l1b.bm.segment_report()) == 0 and _out8.get("persisted") is False,
+          f"npz 未变={_m0 == _m1} · 折前↔折后 max|d|={_d8a:.3e} · 折前↔重载 max|d|={_d8b:.3e}"
+          f" · 重载已挂段={sorted(_l1b.bm.segment_report())} · persisted={_out8.get('persisted')}")
+except Exception as _e:                                       # noqa: BLE001
+    check("T8 L1: fold without persist leaves npz untouched", False,
+          f"raised {type(_e).__name__}: {str(_e)[:90]}")
 
 print("-" * 60)
 print("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS))

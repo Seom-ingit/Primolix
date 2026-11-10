@@ -30,7 +30,7 @@ z = Primolix("docs/.idx")                      # 打开已有索引
 | `Primolix.build(root, out='.primolix_index', dense=False, model_path='', workers=0, skip_dirs=None)` | 建索引（classmethod）。`dense=True` 时另落 `dense.npy` |
 | `Primolix(index_dir, dense=False, model_path='')` | 打开索引（读盘） |
 | `query(q, k=10, dense=False)` | 检索，返回 `[{'rank','score','file','line','text'}]`，**按分数降序**，遇 `score<=0` 截断 |
-| `update(root, workers=0)` | 按源文件 md5 差异做增量，返回 `{'kind', 'detail'}`（见第 5 节契约） |
+| `update(root, workers=0, verify='auto')` | 按源文件差异做增量，返回 `{'kind', 'detail', 'verify'}`（见第 5 节契约）。`verify` 三档：`'auto'`（有 `(size, mtime_ns)` 印记就走 `'stat'`）/ `'stat'`（只比元数据，不读内容）/ `'full'`（每个文件算 md5） |
 | `rebuild_in_place(root, workers=0)` | 整库重建到同一目录（词表外回退、或显式重建） |
 | `info` | 属性：`N`（chunk 数）、`V`、`size_mb` 等 |
 | `browse(file=None, page=0, n=20)` | 浏览分块（CLI `browse` 用它） |

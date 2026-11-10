@@ -16,6 +16,8 @@ Checks (each prints PASS/FAIL; process exits 1 if anything fails):
   8  delete under a segment: folds first, then increments (durable, no resurrection)
   9  reload from disk is deterministic (same files and scores)
   10 facade: `diagnose()` explains an all-OOV query; `explain(diagnose=True)` is opt-in only
+  11 verify=stat: touching mtime alone is not a change (content hash still decides)
+  12 verify=stat: a real content change is still caught
 
   Not covered here: the view family (see docs/api.md).
 """
@@ -188,6 +190,23 @@ check("10 diagnose explains an all-OOV query; explain(diagnose=True) is opt-in o
       and isinstance(e10_plain, list),
       f"status={d10.get('status')!r} · terms={len(d10.get('terms') or [])}"
       f" · explain->{type(e10).__name__}/diagnose={type(e10_plain).__name__}")
+
+# ---------------------------------------------------------------- 11/12 verify=stat 快扫
+# 0.2.2：只有 (size, mtime) 变了才读内容；纯触摸（内容不变）不算变更；返回里如实带 verify。
+_c_before = (root / "c.txt").read_bytes()
+os.utime(root / "c.txt", None)                       # 只改 mtime
+rep11 = z.update(str(root), verify="stat")
+check("11 verify=stat: touching mtime alone is not a change (content hash still decides)",
+      rep11.get("kind") == "noop" and rep11.get("verify") == "stat"
+      and (root / "c.txt").read_bytes() == _c_before,
+      f"update() -> kind={rep11.get('kind')!r} verify={rep11.get('verify')!r}")
+
+(root / "c.txt").write_text("bm25 sparse index and postings and postings\n" * 3, encoding="utf-8")
+rep12 = z.update(str(root), verify="stat")
+check("12 verify=stat: a real content change is still caught",
+      rep12.get("kind") == "incremental" and rep12.get("verify") == "stat",
+      f"update() -> kind={rep12.get('kind')!r} verify={rep12.get('verify')!r} "
+      f"detail={rep12.get('detail')!r}")
 
 shutil.rmtree(work, ignore_errors=True)
 print("-" * 60)

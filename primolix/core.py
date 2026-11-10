@@ -108,26 +108,57 @@ def get_dense_model(model_path=''):
 # ---------------- 文件扫描与分块（纯 stdlib） ----------------
 
 def iter_files(root: Path, skip_dirs=None):
-    """遍历 root 下文件。``skip_dirs``: 绝对路径集合（跳过其下所有文件, 如索引目录）。"""
-    skip_prefix = tuple(
-        str(Path(d).resolve()).replace('\\', '/').rstrip('/').lower() + '/'
-        for d in (skip_dirs or []))
-    for p in sorted(root.rglob('*')):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(root)
-        if any(part in EXCLUDE_DIRS for part in rel.parts):
-            continue
-        if str(p.resolve()).replace('\\', '/').lower().startswith(skip_prefix):
-            continue
-        if p.name in {'.env', '.env.local'} or p.suffix.lower() in EXCLUDE_EXT:
-            continue
+    """遍历 root 下文件（**os.scandir 递归**：用 dirent 自带的类型/大小，避免每文件 `resolve` ＋ 重复 `stat`）。
+
+    · `skip_dirs`：绝对路径集合，其下所有文件跳过（如索引目录自身）。按相对前缀跳过，
+      不再对每个文件调 `resolve()` —— 那是原实现里最贵的一笔（每文件一次路径解析）。
+    · 返回 `[(Path, rel_path)]`，按 `rel` 字符串排序（与原实现同序，保住建库/切段的确定性）。
+    · `rel` 用平台原生分隔符（与原实现一致）—— 哈希字典的键靠它，别改成 `/`。
+    """
+    root = Path(root)
+    try:
+        root_abs = root.resolve()
+    except OSError:                                    # 极少数：路径不可解析 → 退回原样
+        root_abs = root
+    skip_rel = set()
+    for d in (skip_dirs or []):
         try:
-            if p.stat().st_size > MAX_FILE_BYTES:
-                continue
+            rel_d = Path(d).resolve().relative_to(root_abs)
+            skip_rel.add(str(rel_d).replace('\\', '/').lower())
+        except (ValueError, OSError):
+            continue                                   # 不在 root 下 ⇒ 不影响遍历
+    out = []
+    stack = [("", root_abs)]
+    while stack:
+        rel_base, cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    name = e.name
+                    relp = Path(rel_base) / name if rel_base else Path(name)
+                    rel_posix = str(relp).replace('\\', '/').lower()
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            if name in EXCLUDE_DIRS or rel_posix in skip_rel:
+                                continue
+                            stack.append((str(relp), Path(e.path)))
+                            continue
+                        if not e.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    if name in {'.env', '.env.local'} or Path(name).suffix.lower() in EXCLUDE_EXT:
+                        continue
+                    try:
+                        if e.stat(follow_symlinks=False).st_size > MAX_FILE_BYTES:
+                            continue
+                    except OSError:
+                        continue
+                    out.append((Path(e.path), relp))
         except OSError:
             continue
-        yield p, rel
+    out.sort(key=lambda pr: str(pr[1]))
+    return out
 
 
 def file_hash(p: Path):
@@ -176,21 +207,63 @@ def chunk_code(text, rel):
     return out
 
 
-def scan_root(root: Path, skip_dirs=None):
-    """返回 [(rel_path_str, hash, [chunks...])]; chunks=[(text, rel, line)]"""
-    files = []
+def scan_root_ex(root: Path, skip_dirs=None, known=None, stamps=None, verify="full"):
+    """扫描语料目录。返回 `(files, stamps_now)`。
+
+    `files`   = `[(rel, md5, chunks|None)]`（`known` 命中 ⇒ `chunks=None`）
+    `stamps`  = `{rel: (size, mtime_ns)}`，只含进入了 `files` 的文件
+
+    `verify`：
+        `"full"`（默认）—— 每个文件读内容算 md5；
+        `"stat"`        —— 先比 `(size, mtime_ns)`，元数据没变就不读内容（实测 ~1/10 成本）；
+                           元数据变了才读，内容 hash 没变时仍算"未变"（只刷新 stamp）。
+
+    `"stat"` 的前提是写入方会更新 mtime；保留 mtime 的还原类工具会漏报 ⇒ 用 `"full"` 兜底。
+    缺 `known`/`stamps` 时 `"stat"` 如实退回 `"full"`（不假装快扫）。
+    """
+    if verify not in ("full", "stat"):
+        raise ValueError(f"verify 只接受 'full' / 'stat'，实得 {verify!r}")
+    if verify == "stat" and (known is None or stamps is None or not stamps):
+        verify = "full"
+    files, stamps_now = [], {}
     for p, rel in iter_files(root, skip_dirs):
-        try:
-            text = p.read_text(encoding='utf-8', errors='ignore')
-        except Exception:
-            continue
-        h = file_hash(p)
         rel_s = str(rel)
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        stamp = (int(st.st_size), int(st.st_mtime_ns))
+        if verify == "stat" and rel_s in known and stamps.get(rel_s) == stamp:
+            files.append((rel_s, known[rel_s], None))     # 元数据未变：不读内容
+            stamps_now[rel_s] = stamp
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        h = hashlib.md5(data).hexdigest()
+        if known is not None and known.get(rel_s) == h:
+            files.append((rel_s, h, None))                # 内容未变（可能只是 mtime 变了）
+            stamps_now[rel_s] = stamp
+            continue
+        text = data.decode('utf-8', errors='ignore')
         ext = p.suffix.lower()
         chunks = chunk_code(text, rel_s) if ext in CODE_EXT else chunk_prose(text, rel_s)
         if chunks:
             files.append((rel_s, h, chunks))
-    return files
+            stamps_now[rel_s] = stamp
+    return files, stamps_now
+
+
+def scan_root(root: Path, skip_dirs=None, known=None):
+    """返回 [(rel_path_str, hash, chunks)]；chunks=[(text, rel, line)]。
+
+    `known`（`{rel: md5}`，只有 `update()` 会传）：命中 ⇒ 该文件不 decode、不切段，第三项为 `None`
+    （调用方必须跳过 `None`；`build` 不传 `known`，所以永远拿到真 chunks）。
+    每个文件只 读一次字节：同一次读既算 md5 又（必要时）decode。
+    需要 `stat` 快扫或拿 `(size, mtime_ns)` ⇒ 用 `scan_root_ex()`。
+    """
+    return scan_root_ex(root, skip_dirs, known=known)[0]
 
 
 # ---------------- Primolix 索引对象 ----------------
@@ -319,7 +392,11 @@ class Primolix:
         self._meta = None
         self._rows = None          # 活跃 chunk 的物理行号缓存 (每个 `self._meta =` 点置 None)
         self._rows_ident = None    # ⭐ 01m：`(rows 对象, 是否恒等)` —— 见 `_active_rows`
-        self._hashes = None
+        self._hashes = None        # {rel: md5}
+        self._stamps = {}          # {rel: (size, mtime_ns)} —— `verify="stat"` 快扫的物理前提
+        self._delta_nnz = 0        # delta 累计 nnz（L2：用来判压实）
+        self._delta_count = 0      # delta 文件数
+        self._persisted_V = 0      # 盘上（npz ＋ 已提交 delta）能重建出的词表宽度
         self._vecs = None
         self._dense = dense
         self._model_path = model_path
@@ -342,7 +419,7 @@ class Primolix:
         self._stream = _norm_stream(stream)
         t0 = time.time()
         _say("扫描文件...")
-        files = scan_root(Path(root), skip_dirs)
+        files, _stamps = scan_root_ex(Path(root), skip_dirs)
         chunks = []
         for rel, h, cs in files:
             for t, r, ln in cs:
@@ -356,6 +433,7 @@ class Primolix:
         self._meta = chunks
         self._rows = None
         self._hashes = {rel: h for rel, h, _ in files}
+        self._stamps = _stamps          # size/mtime 印记：下一次 update 可走 stat 快扫
         self._persist()
         if dense:
             self._encode_dense()
@@ -368,14 +446,67 @@ class Primolix:
     def _persist(self):
         """落盘 bm25.npz + meta.jsonl + hashes.json（build/update 共用）。
 
-        `w_cache=True` 时额外把物化层 `w` 写进 `.mm/`。
+        `hashes.json` 自 0.2.2 起是 `{"v":2, "hashes": {...}, "stamps": {rel: [size, mtime_ns]}}`；
+        `stamps` 是 `verify="stat"` 快扫的物理前提（缺它就退化成每次读内容）。
+
+        全量落盘会盖掉之前所有 delta（npz 里已经有那些行）⇒ 写完就清 `.delta/`。
         """
         self._bm.save(str(self.dir / 'bm25.npz'), w_cache=bool(getattr(self, "_w_cache", False)))
         with open(self.dir / 'meta.jsonl', 'w', encoding='utf-8') as f:
             for c in self._meta:
                 f.write(json.dumps(c, ensure_ascii=False) + '\n')
+        self._write_hashes()
+        self._clear_deltas()
+        self._delta_nnz = 0
+        self._delta_count = 0
+        self._persisted_V = int(self._bm.V)     # 全量落盘后，盘上的词表 = 当前词表
+
+    def _maybe_compact_delta(self) -> dict | None:
+        """L2/S3：delta 攒到阈值就压实一次（全量落盘 ＋ 清空 `.delta/`）。
+
+        两条触发：`Σdelta.nnz > DELTA_COMPACT_RATIO × base.nnz`（空间）或
+        `delta 文件数 ≥ DELTA_MAX_FILES`（加载要逐个回放，文件太多会拖慢启动）。
+        只在 `PERSIST_MODE == "delta"` 且当前没有挂段时才会真的写盘。
+        """
+        if PERSIST_MODE != "delta" or self._delta_count <= 0:
+            return None
+        if self._bm.segment_report():
+            return None                       # 段在场 ⇒ `save()` 会抛错，等折完再说
+        base = int(self._bm.T.nnz) - int(self._delta_nnz)
+        big = int(self._delta_nnz) > DELTA_COMPACT_RATIO * max(base, 1)
+        many = int(self._delta_count) >= DELTA_MAX_FILES
+        if not (big or many):
+            return None
+        t0 = time.time()
+        cnt, nnz = self._delta_count, self._delta_nnz
+        self._persist()
+        out = dict(compacted=True, why=("nnz" if big else "files"),
+                   deltas=cnt, delta_nnz=nnz, ms=(time.time() - t0) * 1000.0)
+        _say(f"[压实] {cnt} 个 delta（{nnz:,} nnz）→ 全量落盘 {out['ms']:.0f} ms")
+        return out
+
+    def _clear_deltas(self):
+        """删除 `.delta/*`（全量落盘之后调用；未 rename 的 `.tmp` 一并清）。"""
+        d = Path(self.dir) / DELTA_SUBDIR
+        if not d.exists():
+            return 0
+        n = 0
+        for p in list(d.glob("*.npz")) + list(d.glob("*.tmp")):
+            try:
+                p.unlink()
+                n += 1
+            except OSError:
+                pass
+        return n
+
+    def _write_hashes(self):
+        """只写 `hashes.json`（v2 格式，含 size/mtime 快扫印记）。"""
+        doc = {"v": 2,
+               "hashes": self._hashes or {},
+               "stamps": {k: [int(v[0]), int(v[1])]
+                          for k, v in (getattr(self, "_stamps", None) or {}).items()}}
         with open(self.dir / 'hashes.json', 'w', encoding='utf-8') as f:
-            json.dump(self._hashes, f, ensure_ascii=False, indent=1)
+            json.dump(doc, f, ensure_ascii=False, indent=1)
 
     def _persist_under_segments(self):
         """段在场时的落盘：`meta.jsonl`（**只写主表行**）＋ `hashes.json`，⛔ 不动 `bm25.npz`。
@@ -391,8 +522,192 @@ class Primolix:
             for c in self._meta:
                 if int(c.get('row', -1)) < seg_floor:
                     f.write(json.dumps(c, ensure_ascii=False) + '\n')
-        with open(self.dir / 'hashes.json', 'w', encoding='utf-8') as f:
-            json.dump(self._hashes, f, ensure_ascii=False, indent=1)
+        self._write_hashes()
+
+    # ---------- L2：增量持久化（delta 日志） ----------
+
+    def _write_meta_full(self):
+        """重写 `meta.jsonl`（全部活跃 chunk）。⛔ 不写 npz —— delta 模式用它。"""
+        with open(self.dir / 'meta.jsonl', 'w', encoding='utf-8') as f:
+            for c in self._meta:
+                f.write(json.dumps(c, ensure_ascii=False) + '\n')
+
+    def _persist_delta(self, new_rows, dead_rows, meta_rows=None) -> dict:
+        """把这一批的追加行与墓碑写成 `delta/<seq>.npz`（**只写 O(新 nnz)**）。
+
+        提交语义与段一致：先写 `.tmp`，再 `os.replace` —— rename 才是提交点。
+        `base_N` 记下"这一批写之前主表多少行"，回放时按它做链式校验（对不上就停，不猜）。
+
+        `meta_rows`（2026-11-10 补）：这批新 chunk 的身份（docid/file/line/text）也写进 delta。
+        为什么必须带着走：写入顺序是 `delta → meta.jsonl → hashes.json`，若崩在 delta 与 meta 之间，
+        盘上就会"有行、没身份" —— 重载后这些行占着 N、算进 df，却永远搜不到，而且下次
+        `update()` 看到 hash 未变就 noop ⇒ 不会自愈。带上身份之后，rename 就是唯一提交点，
+        `meta.jsonl` 降级为快照。
+        """
+        d = Path(self.dir) / DELTA_SUBDIR
+        d.mkdir(parents=True, exist_ok=True)
+        seq = 1 + max([int(p.stem) for p in d.glob("*.npz")], default=0)
+        bm = self._bm
+        T = bm.T.tocsr()
+        rows = [int(r) for r in (new_rows if new_rows is not None else [])]
+        ptr = [0]
+        idx_parts, dat_parts = [], []
+        for r in rows:
+            lo, hi = int(T.indptr[r]), int(T.indptr[r + 1])
+            if hi > lo:
+                idx_parts.append(np.asarray(T.indices[lo:hi], dtype=np.int32))
+                dat_parts.append(np.asarray(T.data[lo:hi], dtype=np.float32))
+            ptr.append(ptr[-1] + max(hi - lo, 0))
+        pv = int(getattr(self, "_persisted_V", 0) or 0)
+        new_terms = list(bm.idx2term)[pv:] if int(bm.V) > pv else []
+        meta_payload = [{k: c.get(k) for k in ("docid", "file", "line", "text", "row")}
+                        for c in (meta_rows or [])]
+        rec = dict(
+            seq=np.int64(seq),
+            base_N=np.int64(int(bm.N) - len(rows)),
+            N_after=np.int64(int(bm.N)),
+            ptr=np.asarray(ptr, dtype=np.int64),
+            idx=(np.concatenate(idx_parts) if idx_parts else np.zeros(0, np.int32)),
+            dat=(np.concatenate(dat_parts) if dat_parts else np.zeros(0, np.float32)),
+            dl=(np.asarray([float(bm.dl[r]) for r in rows], dtype=np.float32)
+                if rows else np.zeros(0, np.float32)),
+            dead=np.asarray([int(r) for r in (dead_rows if dead_rows is not None else [])],
+                            dtype=np.int64),
+            V=np.int64(int(bm.V)),
+            vocab_json=np.asarray(json.dumps(new_terms, ensure_ascii=False)),
+            meta_json=np.asarray(json.dumps(meta_payload, ensure_ascii=False)),
+        )
+        tmp = d / f"{seq:06d}.npz.tmp"
+        with open(tmp, "wb") as fh:                    # ⚠️ 传文件对象：savez 不会再补 .npz
+            np.savez_compressed(fh, **rec)
+        final = d / f"{seq:06d}.npz"
+        os.replace(tmp, final)                          # ⭐ 提交点
+        self._delta_nnz += int(rec["idx"].size)
+        self._delta_count += 1
+        self._persisted_V = int(bm.V)          # 已提交的 delta 已把新词带进盘上的链
+        return dict(seq=seq, path=str(final), rows=len(rows), dead=len(rec["dead"]),
+                    nnz=int(rec["idx"].size), bytes=int(final.stat().st_size))
+
+    def _merge_meta(self, parts) -> int:
+        """把 delta 带来的文档身份并进 `_meta`（按 `row` 去重；⛔ 墓碑行不复活）。"""
+        have = {int(c.get('row', -1)) for c in self._meta}
+        dead = getattr(self._bm, '_dead', None)
+        n_lim = int(self._bm.N)
+        add = []
+        for c in parts:
+            try:
+                r = int(c.get('row', -1))
+            except (TypeError, ValueError):
+                continue
+            if r < 0 or r >= n_lim or r in have:
+                continue
+            if dead is not None and r < int(dead.size) and bool(dead[r]):
+                continue                                    # 已删：身份不补，否则"幽灵文档"复活
+            have.add(r)
+            add.append(c)
+        if add:
+            self._meta = sorted(self._meta + add, key=lambda c: int(c.get('row', -1)))
+            self._rows = None
+        return len(add)
+
+    def _replay_deltas(self) -> dict:
+        """按 seq 回放 `.delta/*.npz`（链式校验 `base_N`；对不上就停并如实报告）。"""
+        files = delta_files(self.dir)
+        if not files:
+            self._delta_nnz = 0
+            self._delta_count = 0
+            self._persisted_V = int(self._bm.V)
+            return dict(applied=0, stopped=None)
+        from .kernel import _sp_vstack
+        from scipy import sparse as sp
+        bm = self._bm
+        blocks, dls, deads = [], [], []
+        meta_parts = []
+        N, applied, stopped = int(bm.T.shape[0]), 0, None
+        total_nnz = 0
+        for p in files:
+            with np.load(p, allow_pickle=False) as z:
+                if int(z["base_N"]) != N:
+                    stopped = (p.name, int(z["base_N"]), N)
+                    _say(f"[delta] {p.name} base_N={int(z['base_N'])} ≠ 当前 {N}"
+                         f" → 停止回放（⛔ 不猜，后续 delta 全部忽略）")
+                    break
+                k = int(z["dl"].size)
+                # 词表先扩到 delta 记的宽度：段带来的新词不在 npz 里，必须由 delta 带着
+                vt = json.loads(str(z["vocab_json"])) if "vocab_json" in z.files else []
+                if vt:
+                    bm.idx2term = list(bm.idx2term) + list(vt)
+                    bm.term2idx = {t: i for i, t in enumerate(bm.idx2term)}
+                    bm.df = np.concatenate([np.asarray(bm.df, np.int32),
+                                            np.zeros(len(vt), np.int32)]).astype(np.int32)
+                V = max(int(bm.V), int(z["V"]))
+                blk = sp.csr_matrix((np.asarray(z["dat"], np.float32),
+                                     np.asarray(z["idx"], np.int32),
+                                     np.asarray(z["ptr"], np.int64)), shape=(k, V))
+                blocks.append(blk)
+                dls.append(np.asarray(z["dl"], np.float32))
+                if int(z["dead"].size):
+                    deads.append(np.asarray(z["dead"], np.int64))
+                N = int(z["N_after"])
+                total_nnz += int(np.asarray(z["idx"]).size)
+                if "meta_json" in z.files:            # ⭐ 身份跟着 delta 走（见 _persist_delta）
+                    meta_parts.extend(json.loads(str(z["meta_json"])))
+                applied += 1
+        if not blocks:
+            self._delta_nnz = 0
+            self._delta_count = 0
+            return dict(applied=0, stopped=stopped)
+        V = int(bm.V)
+        if any(b.shape[1] != V for b in blocks):       # 各 delta 的列宽可能不同（词表在长）
+            blocks = [b if b.shape[1] == V else
+                      sp.csr_matrix((b.data, b.indices, b.indptr), shape=(b.shape[0], V))
+                      for b in blocks]
+        T0 = bm.T.tocsr()
+        if int(T0.shape[1]) != V:                      # ⚠️ 主表也要补到同一列宽，否则 vstack 直接报错
+            T0 = sp.csr_matrix((T0.data, T0.indices, T0.indptr),
+                               shape=(int(T0.shape[0]), V))
+        bm.T = _sp_vstack([T0] + blocks, format="csr").astype(np.float32)
+        bm.dl = np.concatenate([np.asarray(bm.dl, np.float32)] + dls)
+        # df 必须跟着补：npz 里的 df 不含 delta 行的贡献；每行内列号唯一
+        #    ⇒ 每列出现几次就是"几篇文档含该词"（与 `mount_segment` 的 `diff(indptr)` 同义）。
+        df_add = np.zeros(int(bm.V), dtype=np.int32)
+        for b in blocks:
+            if b.nnz:
+                df_add += np.bincount(np.asarray(b.indices, np.int64),
+                                      minlength=int(bm.V)).astype(np.int32)
+        bm.df = (np.asarray(bm.df, np.int32) + df_add).astype(np.int32)
+        if int(bm.T.shape[0]) != int(N):
+            raise RuntimeError(f"delta 回放后行数 {int(bm.T.shape[0])} ≠ N_after {N}")
+        bm.N = int(N)
+        if deads:
+            dd = np.concatenate(deads)
+            dead = (np.zeros(int(bm.N), bool) if bm._dead is None
+                    else np.asarray(bm._dead, bool))
+            if dead.size < int(bm.N):
+                dead = np.concatenate([dead, np.zeros(int(bm.N) - dead.size, bool)])
+            for r in dd:
+                r = int(r)
+                if r < 0 or r >= dead.size or dead[r]:
+                    continue
+                lo, hi = int(bm.T.indptr[r]), int(bm.T.indptr[r + 1])
+                if hi > lo:
+                    bm.df[bm.T.indices[lo:hi]] -= 1
+                dead[r] = True
+            np.maximum(bm.df, 0, out=bm.df)
+            bm._dead = dead
+        bm._Tbuf = None
+        bm._invalidate_w()
+        bm._recompute_stats()
+        if meta_parts:                       # ⭐ 身份以 delta 为准补齐（meta.jsonl 只是快照）
+            added = self._merge_meta(meta_parts)
+            if added:
+                _say(f"[delta] 从 delta 补回 {added} 条文档身份（meta.jsonl 落后于 delta）")
+        self._delta_nnz = int(total_nnz)
+        self._delta_count = int(applied)
+        self._persisted_V = int(bm.V)
+        _say(f"[delta] 回放 {applied} 个 delta → N={int(bm.N):,}（停在 {stopped}）"
+             if stopped else f"[delta] 回放 {applied} 个 delta → N={int(bm.N):,}")
+        return dict(applied=applied, stopped=stopped)
 
     def _load(self):
         # 索引目录含 dense.npy → 视为 dense 索引 (update/reload 保持 dense 一致)
@@ -404,7 +719,19 @@ class Primolix:
         #    缺字段 = 旧版索引 → 按默认档。
         self._stream = _norm_stream(getattr(self._bm, "stream_mode", "off"))
         hf = self.dir / 'hashes.json'
-        self._hashes = json.load(open(hf, encoding='utf-8')) if hf.exists() else {}
+        doc = json.load(open(hf, encoding='utf-8')) if hf.exists() else {}
+        if isinstance(doc, dict) and doc.get("v") == 2:      # 0.2.2+：hashes ＋ stamps
+            self._hashes = doc.get("hashes") or {}
+            self._stamps = {k: (int(v[0]), int(v[1]))
+                            for k, v in (doc.get("stamps") or {}).items()}
+        else:                                                # 旧格式：rel → md5，无快扫印记
+            self._hashes = doc or {}
+            self._stamps = {}
+        # L2：回放 delta 日志（若有）。必须在挂段之前 —— 段的 row_base 依赖 `bm.N`。
+        try:
+            self._replay_deltas()
+        except Exception as _e:                              # noqa: BLE001
+            _say(f"[警告] delta 回放失败（{_e!r}）→ 按 npz 状态可用，但最近的增量可能缺失")
         self._vecs = None
         if self._dense:
             f = self.dir / 'dense.npy'
@@ -606,49 +933,67 @@ class Primolix:
 
     # ---------- 真增量 update（方案 A） ----------
 
-    def compact_segments(self) -> dict:
-        """把已挂段全部折进主表 ＋ 落盘 ＋ 清分块缓存。
+    def compact_segments(self, *, persist=True) -> dict:
+        """把已挂段全部折进主表 ＋（可选）落盘 ＋ 清分块缓存。
 
         `api.Index.compact()` 与 `update()` 的 `fold_first` 出口共用这一个实现。
-        顺序：折叠 → `_persist()`（先落盘）→ 追加 `folded_all`（提交点）→ 重建单块。
-        反过来就是"先提交后落盘"：崩溃时旁车说已折叠、npz 里没有那些行 ⇒ 段内容静默丢失。
+        `persist` 三态：
+
+        · `True`：折叠 → `_persist()`（先落盘）→ 追加 `folded_all`（提交点）。
+          反过来就是"先提交后落盘"：崩溃时旁车说已折叠、npz 里没有那些行 ⇒ 段内容静默丢失。
+        · `False`（L1）：只折内存，npz 与 `folded_all` 都不写 —— 盘上保持
+          「旧主表 ＋ 段清单」的等价状态，重载按旁车重挂即可复原。
+        · `"delta"`（L2/S4）：把折出来的行写成一条 delta，再追加 `folded_all`。
+          顺序是 delta → meta/hashes → 事件：若在 delta 与事件之间崩，重载会重挂段，
+          但此时 T 已因 delta 变长、`T.shape[0] > row_base` 会把重挂跳过 ⇒ 不重复计数。
+        `False` 时两件事必须同时省：只省 npz 却写事件 ⇒ 重载以为已折、盘上却没有那些行。
         """
         bm = self._bm
         segs = list(bm.segment_report())
         if not segs:
             return dict(folded=[], tags=[], blocks=len(bm._tc_blocks or []),
-                        N=int(bm.N), V=int(bm.V), ms=0.0, via=None)
+                        N=int(bm.N), V=int(bm.V), ms=0.0, via=None, persisted=False,
+                        persist_mode=persist)
         t0 = time.time()
+        n0 = int(bm.T.shape[0])                # ⚠️ 折叠前的**主表**行数（`bm.N` 已含段行，不能用它）
+                                               #    折出来的行是 [n0, N)；delta 的 base_N 也必须是 n0
         if len(segs) > 1:
             # 多段时走内核的 `fold_all()`（`fold_segment` 的不变量在多段下不成立）
             info = bm.fold_all()
             bm._tc_blocks, bm._tc_rows = [], 0
             bm._invalidate_w()
             bm._recompute_stats()
-            self._persist()                       # ⭐ 先落盘（折叠改了 T 与 meta）
             bm._ensure_tc()
             tags = list(info["tags"])
             folded = [dict(tag=t, **{k: v for k, v in info.items() if k != "tags"})
                       for t in tags]
-            manifest_append(self.dir, {"event": "folded_all", "tags": tags,
-                                       "via": "compact/fold_all"})
             via = "fold_all"
         else:
             folded = [dict(tag=t, **bm.fold_segment(t)) for t in segs]
             tags = [f["tag"] for f in folded]
-            self._persist()                       # ⭐ 先落盘（同上）
-            manifest_append(self.dir, {"event": "folded_all", "tags": tags,
-                                       "via": "compact/fold_segment"})
             bm._tc_blocks, bm._tc_rows = [], 0
             bm._invalidate_w()
             bm._recompute_stats()
             bm._ensure_tc()                       # 立刻建回单块（否则下一次查询才建）
             via = "fold_segment"
+        if persist is True or persist == "delta":
+            if persist == "delta":
+                _n1 = int(bm.N)
+                self._persist_delta(range(n0, _n1), [],
+                                    meta_rows=[c for c in self._meta
+                                               if n0 <= int(c.get('row', -1)) < _n1])
+                self._write_meta_full()
+                self._write_hashes()
+            else:
+                self._persist()                   # ⭐ 先落盘（折叠改了 T 与 meta）
+            manifest_append(self.dir, {"event": "folded_all", "tags": tags,
+                                       "via": f"compact/{via}"})
         self._rows = None
         return dict(folded=folded, tags=tags, blocks=len(bm._tc_blocks or []),
-                    N=int(bm.N), V=int(bm.V), ms=(time.time() - t0) * 1000.0, via=via)
+                    N=int(bm.N), V=int(bm.V), ms=(time.time() - t0) * 1000.0, via=via,
+                    persisted=bool(persist), persist_mode=persist)
 
-    def update(self, root, workers=0):
+    def update(self, root, workers=0, *, verify="auto"):
         """hash diff ＋ 路由（`primolix.routing.route_update`）。
 
         四个出口，返回里的 `kind` 与之一一对应：
@@ -658,23 +1003,36 @@ class Primolix:
             rebuild      兜底：某条 precondition 不满足（dense / 段数上限 / 批太大）
         判不了或安全执行不了（例如段在场却只能重建）→ 抛 `RuntimeError`，
         不静默选一条。判据见 `04c_丙档OOV路由_设计与判据_2026-11-08.md`。
+
+        `verify`（0.2.2）：
+            `"auto"`（默认）—— 有 `(size, mtime_ns)` 印记就走 `"stat"`，否则退回 `"full"`；
+            `"stat"`        —— 只比元数据，没变就不读内容（实测 ~1/10 成本）；
+            `"full"`        —— 每个文件读内容算 md5（保留 mtime 的还原类工具必须用这档）。
+        返回里带 `verify`，如实说明这一批到底校验到了什么程度。
         """
         if self._bm is None:
             self._load()
         self._dense = self._dense or (self.dir / 'dense.npy').exists()
         t0 = time.time()
+        mode = verify
+        if mode == "auto":
+            mode = "stat" if getattr(self, "_stamps", None) else "full"
+        if mode not in ("full", "stat"):
+            raise ValueError(f"verify 只接受 'auto' / 'full' / 'stat'，实得 {verify!r}")
         # 排除索引输出目录自身 (可能在 root 内部, 如 <root>/.idx)
-        files = scan_root(Path(root), [self.dir])
+        files, stamps_now = scan_root_ex(Path(root), [self.dir], known=(self._hashes or {}),
+                                         stamps=getattr(self, "_stamps", None) or {},
+                                         verify=mode)
         new = {rel: h for rel, h, _ in files}
         old = self._hashes
         added = [r for r in new if r not in old]
         removed = [r for r in old if r not in new]
         changed = [r for r in new if r in old and new[r] != old[r]]
         unchanged = len(new) - len(added) - len(changed)
-        _say(f"S4 hash diff: 新增 {len(added)} / 删除 {len(removed)} / "
+        _say(f"S4 hash diff（verify={mode}）: 新增 {len(added)} / 删除 {len(removed)} / "
               f"变更 {len(changed)} / 跳过 {unchanged} ({unchanged / max(len(new), 1):.0%})")
         if not (added or removed or changed):
-            return {'kind': 'noop', 'detail': '库已同步, 无需重建'}
+            return {'kind': 'noop', 'detail': '库已同步, 无需重建', 'verify': mode}
 
         # ---- 收集新 chunk (added 全文件 + changed 文件的新内容)，分词一次复用 ----
         rel2scan = {x[0]: x for x in files}
@@ -719,10 +1077,24 @@ class Primolix:
         fold_note = ""
         cinfo = None
         if route['route'] == FOLD_FIRST:
-            # A / C：当场折回主表，把代价如实记进返回（不再让调用方自己去 compact）
-            cinfo = self.compact_segments()
-            fold_note = f"folded={len(cinfo['tags'])} fold_ms={cinfo['ms']:.1f}"
-            _say(f"[折] {cinfo['tags']} → 主表 {cinfo['N']} 行（{cinfo['ms']:.1f} ms）")
+            # A / C：当场折回主表（不再让调用方自己去 compact）。
+            #    `rebuild` 直接 `rebuild_in_place` —— 所以折叠不必再写一次盘（原先会连写两次）。
+            # 例外：`staged` 分支只写 meta/hashes、不写 npz；若折叠也不落盘，
+            #    meta.jsonl 里的行数会超过盘上主表行数 ⇒ 重载时 `scores[rows]` 越界。
+            #    所以 `then == staged` 时折叠照旧落盘。
+            # 折叠的落盘方式按持久化模式分档（L2/S4）：
+            #    delta 模式 ⇒ 折出来的行写成一条 delta（O(段 nnz)），盘上链不断；
+            #    npz 模式 ＋ then == staged ⇒ 必须落盘（staged 只写 meta/hashes，折叠不落盘会让 meta 账不平）；
+            #    npz 模式 ＋ then ∈ {incremental, rebuild} ⇒ 后续分支自己会全量落盘，折叠不必再写。
+            if PERSIST_MODE == "delta":
+                fold_persist = "delta"
+            else:
+                fold_persist = True if route['then'] == STAGED else False
+            cinfo = self.compact_segments(persist=fold_persist)
+            fold_note = (f"folded={len(cinfo['tags'])} fold_ms={cinfo['ms']:.1f}"
+                         + ("" if cinfo['persisted'] else " (deferred)"))
+            _say(f"[折] {cinfo['tags']} → 主表 {cinfo['N']} 行（{cinfo['ms']:.1f} ms"
+                 f"{'' if cinfo['persisted'] else '，暂不落盘'}）")
             seg_floor = int(self._bm.T.shape[0])
             n_tomb_seg = 0
             route = dict(route, route=route['then'], detail=route['detail'])
@@ -730,7 +1102,8 @@ class Primolix:
             self.rebuild_in_place(root, workers=workers)
             _say(f"S4 回退重建完成 {time.time() - t0:.0f}s")
             return {'kind': 'rebuild',
-                    'detail': f"oov={len(oov)} why={route['code']} {fold_note}".strip()}
+                    'detail': f"oov={len(oov)} why={route['code']} {fold_note}".strip(),
+                    'verify': mode}
 
         # ---- staged：不重建，把这批挂成只读段 ----
         if route['route'] == STAGED:
@@ -754,6 +1127,7 @@ class Primolix:
                                   new_terms=new_terms, new_pos=new_pos)
             self._rows = None          # ⭐ 失效行号缓存（段内文档已并入 _meta）
             self._hashes = new
+            self._stamps = {rel: stamps_now[rel] for rel in new if rel in stamps_now}
             # 段在场 ⇒ `_persist()` 里的 `bm.save()` 会抛错：只落 meta(主表行)＋hashes。
             self._persist_under_segments()
             _say(f"S4 挂段完成 {time.time() - t0:.0f}s (新词 {len(oov)}, 段 {out['tag']}, "
@@ -761,7 +1135,8 @@ class Primolix:
             return {'kind': 'staged',
                     'detail': f"oov={len(oov)} tag={out['tag']} rows={out['rows']} "
                               f"tomb={len(tomb_rows)} {fold_note}".strip(),
-                    'folded_tags': len(cinfo['tags']) if cinfo else 0}
+                    'folded_tags': len(cinfo['tags']) if cinfo else 0,
+                    'verify': mode}
 
         # ---- incremental：词表内就地真增量 ----
         if tomb_rows:
@@ -772,7 +1147,19 @@ class Primolix:
         self._meta = keep_meta + append_chunks
         self._rows = None          # ⭐ 失效行号缓存（行号已迁移/追加）
         self._hashes = new
-        self._persist()          # 走到这里 ⇒ 段已不在场（要折的已在上面折过）
+        self._stamps = {rel: stamps_now[rel] for rel in new if rel in stamps_now}
+        # 持久化分档（L2）：delta 模式只写 O(新 nnz)，npz 模式维持原行为
+        if PERSIST_MODE == "delta":
+            dinfo = self._persist_delta(new_rows, tomb_rows, meta_rows=append_chunks)
+            self._write_meta_full()
+            self._write_hashes()
+            persist_note = f"delta#{dinfo['seq']}({dinfo['nnz']} nnz)"
+            cauto = self._maybe_compact_delta()          # L2/S3：攒到阈值就压实
+            if cauto:
+                persist_note += f"+压实({cauto['why']})"
+        else:
+            self._persist()      # 走到这里 ⇒ 段已不在场（要折的已在上面折过）
+            persist_note = "npz"
         # dense: update 后整库重对齐 (rows 迁移, 旧向量错位; 小语料可负担)
         if self._dense:
             self._encode_dense()
@@ -780,8 +1167,10 @@ class Primolix:
               f"(墓碑 {len(tomb_rows)} 行, 追加 {len(append_chunks)} chunk, "
               f"活跃 {len(self._meta)})")
         return {'kind': 'incremental',
-                'detail': f'tomb={len(tomb_rows)} append={len(append_chunks)} {fold_note}'.strip(),
-                'folded_tags': len(cinfo['tags']) if cinfo else 0}
+                'detail': f'tomb={len(tomb_rows)} append={len(append_chunks)} '
+                          f'{fold_note} {persist_note}'.strip(),
+                'folded_tags': len(cinfo['tags']) if cinfo else 0,
+                'verify': mode}
 
     def rebuild_in_place(self, root, workers=0, *, force=False):
         """整库重建到同一目录（词表外回退 / 显式重建）。保持 dense 开关。
@@ -805,6 +1194,7 @@ class Primolix:
         self._meta = z._meta
         self._rows = None          # ⭐ 失效行号缓存
         self._hashes = z._hashes
+        self._stamps = z._stamps        # 重建后 size/mtime 印记一并换新，下一次可走 stat 快扫
         self._vecs = z._vecs
 
     # 视图按 meta 位置（chunk）对齐挂载，内核侧换算成物理行 + 覆盖位图：update 真增量后物理行号
@@ -957,6 +1347,34 @@ SEG_MANIFEST = "manifest.jsonl"
 # 段级文档身份侧车（乙档）：一行一篇 `{docid,row,file,line,text}`，与段同生共死。
 #    （写到一半崩 ⇒ 历史身份全丢）。侧车是 append-only 的，且先于 manifest 提交写好。
 SEG_DOCS = "docs.jsonl"
+
+# ================================================================ L2：增量持久化开关
+# "npz"（默认）＝每次 `_persist()` 重写整份 npz（0.2.1 及以前的行为）；
+# "delta"     ＝平时只写 `delta/<seq>.npz`（O(新 nnz)），`_persist()` 只在压实时发生。
+# 默认仍是 "npz"：S1 只加分支，现网行为一字不变。切换默认要等 L2-1…L2-5 全过。
+PERSIST_MODE = "npz"
+DELTA_SUBDIR = ".delta"
+DELTA_COMPACT_RATIO = 0.3        # `[提案]`：Σdelta.nnz > 0.3 × base.nnz 就该压实
+DELTA_MAX_FILES = 32             # `[提案]`：delta 文件数上限（加载要逐个回放）
+
+
+def set_persist_mode(mode: str) -> str:
+    """切换持久化模式（进程级）。返回切换后的值。"""
+    global PERSIST_MODE
+    if mode not in ("npz", "delta"):
+        raise ValueError(f"PERSIST_MODE 只接受 'npz' / 'delta'，实得 {mode!r}")
+    PERSIST_MODE = mode
+    return PERSIST_MODE
+
+
+def delta_files(index_dir) -> list:
+    """按 seq 升序返回 `<index>/.delta/*.npz`（⛔ 忽略 `.tmp`：未 rename ＝ 未提交）。"""
+    d = Path(index_dir) / DELTA_SUBDIR
+    if not d.exists():
+        return []
+    out = [p for p in d.glob("*.npz") if p.stem.isdigit()]
+    out.sort(key=lambda p: int(p.stem))
+    return out
 
 
 def seg_docs_path(index_dir, tag) -> Path:
