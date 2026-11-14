@@ -52,6 +52,10 @@ def explain(bm: SparseBM25, row: int, qtoks: list[str], top: int = 4) -> list[tu
 
     分数 = sum_t idf[t] * tf*(k1+1) / (tf + k1*(1-b + b*dl/avgdl))
     """
+    # ⚠️ 增量可能走 staged：新行先落进挂载段，`T` 里还没有它（`N` 已含段行）。
+    #    归因要按行号取 tf，所以先把段折回主表。示例语料很小，折一次的代价可忽略。
+    if getattr(bm, "_segments", None):
+        bm.fold_all()
     n = len(bm.dl)
     dl = float(bm.dl[row])
     avg = float(bm.avgdl)
