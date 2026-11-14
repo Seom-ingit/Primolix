@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "primolix"
-version = "0.2.2"
+version = "0.2.3"
 description = "Primitive-first sparse retrieval kernel: store invertible primitives (tf/df/dl + tombstones), derive scores at query time. Successor to the ZELIX line."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -15,6 +15,7 @@ Run:  python tests/test_delta_persist.py
   D8 自动压实：delta 超阈值时自动全量落盘并清空（S3）
   D9 崩在「delta 已提交、meta 未写」之间：文档仍可见（身份在 delta 里）
   D10 该文档之后被删，重载不许从 delta 的 meta 里复活
+  D11 第一层压实：只合并 delta、⛔ 不动基线 npz，重载逐位
 """
 from __future__ import annotations
 
@@ -163,10 +164,11 @@ def main() -> int:
         core.set_persist_mode("delta")
         _old_r9 = core.DELTA_COMPACT_RATIO
         core.DELTA_COMPACT_RATIO = 1e9
-        meta_bak = (idx / "meta.jsonl").read_bytes()
+        _mf9 = idx / "meta.jsonl"
+        meta_bak = _mf9.read_bytes()
         (root / "i.txt").write_text("kernel index postings kernel\n" * 3, encoding="utf-8")
         rep9b = z.update(str(root))
-        (idx / "meta.jsonl").write_bytes(meta_bak)      # 回滚 ⇒ 模拟「meta 还没写就崩了」
+        _mf9.write_bytes(meta_bak)                      # 回滚 ⇒ 模拟「meta 还没写就崩了」
         z9 = Primolix(str(idx))
         z9._load()
         d9 = maxdiff(scores(z), scores(z9))
@@ -186,6 +188,43 @@ def main() -> int:
               len(z10._meta) == len(z._meta) and d10 == 0.0,
               f"tomb={rep10.get('detail')!r} · meta {len(z._meta)} → {len(z10._meta)}"
               f" · max|d|={d10:.3e}")
+
+        # ---- D11：第一层压实（只合 delta，⛔ 不动基线 npz）----
+        _old_max, _old_r11 = core.DELTA_MAX_FILES, core.DELTA_COMPACT_RATIO
+        core.DELTA_MAX_FILES, core.DELTA_COMPACT_RATIO = 3, 1e9
+        try:
+            m_before = (idx / "bm25.npz").stat().st_mtime_ns
+            for j in range(3):
+                (root / f"j{j}.txt").write_text("kernel index postings\n" * 3, encoding="utf-8")
+                z.update(str(root))
+            m_after = (idx / "bm25.npz").stat().st_mtime_ns
+            n_left = len(core.delta_files(idx))
+        finally:
+            core.DELTA_MAX_FILES, core.DELTA_COMPACT_RATIO = _old_max, _old_r11
+        z11 = Primolix(str(idx))
+        z11._load()
+        d11 = maxdiff(scores(z), scores(z11))
+        check("D11 tier-1 compaction merges deltas without touching the base npz",
+              n_left == 1 and m_before == m_after and d11 == 0.0
+              and len(z11._meta) == len(z._meta),
+              f"deltas={n_left} · npz 未动={m_before == m_after} · meta {len(z._meta)} → "
+              f"{len(z11._meta)} · max|d|={d11:.3e}")
+
+        # ---- D12：meta.jsonl 是追加式（首行不变、只增长）----
+        _mf = idx / "meta.jsonl"
+        _first = _mf.read_text(encoding="utf-8").splitlines()[0]
+        _size = _mf.stat().st_size
+        (root / "k.txt").write_text("kernel index postings\n" * 3, encoding="utf-8")
+        z.update(str(root))
+        _lines = _mf.read_text(encoding="utf-8").splitlines()
+        z12 = Primolix(str(idx))
+        z12._load()
+        d12 = maxdiff(scores(z), scores(z12))
+        check("D12 meta.jsonl is append-only (first line unchanged, file grows)",
+              _lines[0] == _first and _mf.stat().st_size > _size
+              and len(z12._meta) == len(z._meta) and d12 == 0.0,
+              f"首行未变={_lines[0] == _first} · 增长={_mf.stat().st_size - _size}B"
+              f" · meta {len(z._meta)} → {len(z12._meta)} · max|d|={d12:.3e}")
     finally:
         core.set_persist_mode("npz")
         shutil.rmtree(work, ignore_errors=True)

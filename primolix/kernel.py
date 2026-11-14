@@ -24,6 +24,135 @@ except ImportError:  # pragma: no cover - 仅当 scipy 缺失时
 
 LOG_PATH = None
 
+# 0.2.3：npz 的压缩档位（zipfile.compresslevel）。`np.savez_compressed` 固定用 zlib 默认的 6 级，
+#    在 1M 上占全量落盘 22.6 s 里的绝大部分。降到 1 级能把这笔砍掉约 4/5，体积涨 20–30%。
+#    0 ⇒ 完全不压（ZIP_STORED，写 335 MB 只要 0.36 s，但盘上四倍大）。
+NPZ_COMPRESS_LEVEL = 1
+
+
+def set_npz_level(level: int) -> int:
+    """设置 npz 压缩档位（0–9）。返回旧值。"""
+    global NPZ_COMPRESS_LEVEL
+    old = NPZ_COMPRESS_LEVEL
+    NPZ_COMPRESS_LEVEL = int(level)
+    return old
+
+
+# 0.2.3：`.mm/` 侧车（`T_data/T_idx/T_ptr` 的裸 `.npy`，供 mmap）是否随落盘写出。
+#    `True`  ⇒ 冷启可 mmap，代价是多写一份 nnz×4 B（1M ≈ 165.6 MB，≈2 s）。
+#    `False` ⇒ 省掉那 2 s，冷启退化成从 npz 解压（正确性不变，`.mm/` 的世代键会拒用陈旧件）。
+MM_SIDECAR = True
+
+
+def set_mm_sidecar(on: bool) -> bool:
+    """设置落盘时是否写 `.mm/` 侧车。返回旧值。"""
+    global MM_SIDECAR
+    old = MM_SIDECAR
+    MM_SIDECAR = bool(on)
+    return old
+
+
+# 0.2.3：npz 写出的并行度。`0` ⇒ 自动（min(16, CPU)）。1 ⇒ 退化为单线程。
+#    原理：把每个成员按 ~32 MB 切块，各块独立 deflate 并以 `Z_FULL_FLUSH` 收尾——
+#    串联后的字节串仍是合法 deflate 流，所以 zip 里依然是一个成员、格式不变。
+NPZ_THREADS = 0
+
+
+def set_npz_threads(n: int) -> int:
+    """设置 npz 并行压缩线程数（0=自动）。返回旧值。"""
+    global NPZ_THREADS
+    old = NPZ_THREADS
+    NPZ_THREADS = int(n)
+    return old
+
+
+def _npy_member(arr) -> bytes:
+    """把一个数组编码成 `.npy` 字节（含头部），与 `np.save` 写进 zip 的内容同形。"""
+    import io
+
+    from numpy.lib import format as _npf
+    buf = io.BytesIO()
+    _npf.write_array(buf, np.asanyarray(arr), allow_pickle=True)
+    return buf.getvalue()
+
+
+def _deflate_blocks(buf: bytes, level: int) -> bytes:
+    """raw deflate；大块时按块并行，块间用 `Z_FULL_FLUSH` 拼接（仍是单条合法流）。"""
+    import zlib
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = NPZ_THREADS if NPZ_THREADS > 0 else min(16, os.cpu_count() or 1)
+    if len(buf) < (8 << 20) or n < 2:
+        c = zlib.compressobj(level, zlib.DEFLATED, -15)
+        return c.compress(buf) + c.flush()
+
+    step = max(len(buf) // n, 8 << 20)
+    blocks = [buf[i:i + step] for i in range(0, len(buf), step)]
+
+    def _work(b):
+        c = zlib.compressobj(level, zlib.DEFLATED, -15)
+        return c.compress(b) + c.flush(zlib.Z_FULL_FLUSH)
+
+    with ThreadPoolExecutor(max_workers=min(n, len(blocks))) as ex:
+        return b"".join(ex.map(_work, blocks))
+
+
+def _zip_write(path, arrays, level: int) -> int:
+    """手写 zip（存储/压缩均可），成员名 `<name>.npy`。返回落盘字节数。
+
+    不用 `zipfile`：它每条成员只会顺序压缩，压不进并行；但产出必须是合法 zip，
+       否则 `np.load` 读不了。写完由调用方/测试用 `np.load` 回读校验。
+    """
+    import struct
+    import time
+    import zlib
+
+    t = time.localtime()
+    dos_time = (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2)
+    dos_date = ((t.tm_year - 1980) << 9) | (t.tm_mon << 5) | t.tm_mday
+    central = []
+    with open(path, "wb") as f:
+        for name, arr in arrays.items():
+            raw = _npy_member(arr)
+            crc = zlib.crc32(raw) & 0xFFFFFFFF
+            if level <= 0:
+                comp, method = raw, 0
+            else:
+                comp, method = _deflate_blocks(raw, level), 8
+            nb = (str(name) + ".npy").encode("utf-8")
+            off = f.tell()
+            f.write(struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, method, dos_time,
+                                dos_date, crc, len(comp), len(raw), len(nb), 0))
+            f.write(nb)
+            f.write(comp)
+            central.append((nb, crc, len(comp), len(raw), method, off))
+        cd_off = f.tell()
+        for nb, crc, csize, usize, method, off in central:
+            f.write(struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, method,
+                                dos_time, dos_date, crc, csize, usize, len(nb),
+                                0, 0, 0, 0, 0, off))
+            f.write(nb)
+        cd_size = f.tell() - cd_off
+        f.write(struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(central),
+                            len(central), cd_size, cd_off, 0))
+    return int(os.path.getsize(path))
+
+
+def _write_npz(path, arrays, level=None) -> dict:
+    """写 npz（zip ＋ 逐个 `.npy` 成员），**压缩档位与并行度可控**。
+
+    成员名与 `np.savez_compressed` 完全一致（`<name>.npy`），所以读端一行都不用改，
+       旧索引也照旧能读 —— 这是"只换压缩级别、不换格式"。
+    """
+    path = str(path)
+    if not path.endswith(".npz"):        # 与 np.savez* 一致：缺后缀就补
+        path += ".npz"
+    lvl = NPZ_COMPRESS_LEVEL if level is None else int(level)
+    nbytes = _zip_write(path, arrays, lvl)
+    return dict(level=lvl, path=path, bytes=nbytes,
+                threads=NPZ_THREADS if NPZ_THREADS > 0 else min(16, os.cpu_count() or 1))
+
+
 __all__ = [
     "SparseBM25", "zh_tokenize", "simple_tokenize", "tokenizer_status",
     "log", "auto_workers", "ViewError",
@@ -1588,7 +1717,45 @@ class SparseBM25:
         return fused
 
     @_with_read
-    def save(self, path, w_cache=False):
+    def _write_mm_sidecar(self, path):
+        """把 `T_data/T_idx/T_ptr/dl/idf/dead` 写成裸 `.npy`（供 `load` 用 mmap）。
+
+        这是多写一份（1M 上 165.6 MB ≈ 2 s）。`MM_SIDECAR=False` 时整块跳过：
+        冷启退化成从 npz 解压（分数不变），`.mm/` 的世代键会保证陈旧件不被采用。
+        """
+        try:
+            from pathlib import Path as _P2
+            _d2 = _P2(str(path) + ".mm")
+            _d2.mkdir(parents=True, exist_ok=True)
+            if self.T is not None:
+                np.save(_d2 / "T_data.npy", self.T.data)
+                np.save(_d2 / "T_idx.npy", self.T.indices)
+                np.save(_d2 / "T_ptr.npy", self.T.indptr)
+                np.save(_d2 / "T_shape.npy", np.asarray(self.T.shape, dtype=np.int64))
+            for _nm, _fn in (("_idf", "idf.npy"), ("dl", "dl.npy")):
+                _a = getattr(self, _nm, None)
+                if _a is not None:
+                    np.save(_d2 / _fn, _a)
+            if self._dead is not None:
+                np.save(_d2 / "dead.npy", self._dead)
+            # 世代键：`.mm/` 与 npz 必须同代, 否则 `load` 会跨源取字段（`T/dl/idf/dead` ← `.mm/`,
+            #    `df/params/N` ← npz）而同形状静默给错分数。键 = npz 的 `名字|mtime_ns|size`,
+            #    放在 npz 之后写；键不符则 `load` 拒用 `.mm/`（npz 自带 `T_data`, 只退化成"不 mmap"）。
+            _npz = _P2(str(path)) if _P2(str(path)).exists() else _P2(str(path) + ".npz")
+            if _npz.exists():
+                _st = _npz.stat()
+                (_d2 / "mm_key.txt").write_text(
+                    f"v1|{_npz.name}|{_st.st_mtime_ns}|{_st.st_size}"
+                    f"|N={int(self.N)}|nnz={int(self.T.nnz) if self.T is not None else 0}",
+                    encoding="utf-8")
+            _b = 0 if self.T is None else (int(self.T.data.nbytes) + int(self.T.indices.nbytes)
+                                           + int(self.T.indptr.nbytes))
+            log(f"S1 postings 上总线: {_d2}（T {_b:,} B，世代键已写 mm_key.txt）")
+        except Exception as _e:
+            warn(f"[WARN] postings 落盘跳过（附加件失败）: {type(_e).__name__}: {_e!r}"
+                 f"  注意：Windows 上「就地重存」会撞 mmap 锁（既有 .mm/ 已被 mmap）→ 建议存到新目录")
+
+    def save(self, path, w_cache=False, mm=None):
         """落盘索引。`w_cache=True` 时额外把物化层 `w` 写进 `.mm/`（opt-in，默认不写）。
 
         `w` 是派生缓存：盘上同时留 `w_key.txt`（内容型键）；加载时比对，不一致就拒用。
@@ -1622,7 +1789,7 @@ class SparseBM25:
             z.update(fmt='primolix-bm25-v2',
                      W_data=self.W.data, W_idx=self.W.indices,
                      W_ptr=self.W.indptr, W_shape=np.asarray(self.W.shape, dtype=np.int64))
-        np.savez_compressed(path, **z)
+        _write_npz(path, z)
         #    附加落盘（不动上方 npz, 向后兼容不变）。词表常驻 ~9MB(私有) → ~0.14MB(文件后备)。
         #     附加件：失败不许拖垮落盘。
         try:
@@ -1646,37 +1813,8 @@ class SparseBM25:
             warn(f"[WARN] 词表载体落盘跳过（附加件失败，功能不受影响但会退化）: {_e!r}")
         #    落成独立 `.npy`, `load` 可 `mmap_mode='r'`（文件后备、可共享、可丢）。
         #     `df` 故意不落：`_tombstone_rows` 会原地写 `df`（只读 mmap 会当场报错）。
-        try:
-            from pathlib import Path as _P2
-            _d2 = _P2(str(path) + ".mm")
-            _d2.mkdir(parents=True, exist_ok=True)
-            if self.T is not None:
-                np.save(_d2 / "T_data.npy", self.T.data)
-                np.save(_d2 / "T_idx.npy", self.T.indices)
-                np.save(_d2 / "T_ptr.npy", self.T.indptr)
-                np.save(_d2 / "T_shape.npy", np.asarray(self.T.shape, dtype=np.int64))
-            for _nm, _fn in (("_idf", "idf.npy"), ("dl", "dl.npy")):
-                _a = getattr(self, _nm, None)
-                if _a is not None:
-                    np.save(_d2 / _fn, _a)
-            if self._dead is not None:
-                np.save(_d2 / "dead.npy", self._dead)
-            # 世代键：`.mm/` 与 npz 必须同代, 否则 `load` 会跨源取字段（`T/dl/idf/dead` ← `.mm/`,
-            #    `df/params/N` ← npz）而同形状静默给错分数。键 = npz 的 `名字|mtime_ns|size`,
-            #    放在 npz 之后写；键不符则 `load` 拒用 `.mm/`（npz 自带 `T_data`, 只退化成"不 mmap"）。
-            _npz = _P2(str(path)) if _P2(str(path)).exists() else _P2(str(path) + ".npz")
-            if _npz.exists():
-                _st = _npz.stat()
-                (_d2 / "mm_key.txt").write_text(
-                    f"v1|{_npz.name}|{_st.st_mtime_ns}|{_st.st_size}"
-                    f"|N={int(self.N)}|nnz={int(self.T.nnz) if self.T is not None else 0}",
-                    encoding="utf-8")
-            _b = 0 if self.T is None else (int(self.T.data.nbytes) + int(self.T.indices.nbytes)
-                                           + int(self.T.indptr.nbytes))
-            log(f"S1 postings 上总线: {_d2}（T {_b:,} B，世代键已写 mm_key.txt）")
-        except Exception as _e:
-            warn(f"[WARN] postings 落盘跳过（附加件失败）: {type(_e).__name__}: {_e!r}"
-                 f"  注意：Windows 上「就地重存」会撞 mmap 锁（既有 .mm/ 已被 mmap）→ 建议存到新目录")
+        if MM_SIDECAR if mm is None else bool(mm):
+            self._write_mm_sidecar(path)
         # 01h：物化层 `w` 单独一个 try —— 不许被上面 `T_*` 的覆盖失败连坐
         if w_cache and self.T is not None:
             try:

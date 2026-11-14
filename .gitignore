@@ -75,3 +75,6 @@ logs/
 .env
 *.key
 *_token*
+
+# 测试产物（test_delta_persist 会写）
+tests/_delta_run/
