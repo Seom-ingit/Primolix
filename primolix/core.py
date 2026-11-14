@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Python 3.9 兼容：本文件有 `dict | None` 这类 PEP 604 注解。
+#    没有这行 future import 时，3.9 会在定义函数时求值注解并抛 TypeError
+#    （`unsupported operand type(s) for |`），导致整个包 import 失败。CI 的 3.9 job 就是这么红的。
+from __future__ import annotations
 
 import hashlib
 import json
