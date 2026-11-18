@@ -7,11 +7,23 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ⭐ 2026-11-18：ubuntu-latest 滚到 26.04，而 actions/python-versions 的 manifest
+    #    对 3.9 只有 22.04/24.04 的构建（"The version '3.9' was not found for Ubuntu 26.04"）
+    #    ⇒ 3.9 这格必须钉 ubuntu-24.04；其余版本留在 ubuntu-latest。
+    #    3.9 是本包声明的 python 下限（本地无 3.9，CI 是唯一守卫）——不升格、钉镜像。
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.12", "3.13"]
+        include:
+          - python-version: "3.9"
+            os: ubuntu-24.04
+          - python-version: "3.11"
+            os: ubuntu-latest
+          - python-version: "3.12"
+            os: ubuntu-latest
+          - python-version: "3.13"
+            os: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
