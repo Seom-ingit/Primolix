@@ -22,7 +22,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from . import kernel
-from .core import Primolix, get_dense_model, publish_segment, _topk_idx
+from .core import Primolix, get_dense_model, publish_segment, _topk_idx, _unique_seg_tag
 from .kernel import RWLock, SparseBM25, zh_tokenize     # RWLock 复用内核的可重入实现
 
 __all__ = ["RWLock", "Index", "open_index", "build_index", "set_switches"]
@@ -66,6 +66,16 @@ class Index:
         """
         with self._lock.read():
             return self._z.query(q, k=k, dense=dense)
+
+    def search_batch(self, qs, k: int = 10, *, dense: bool = False,
+                     with_text: bool = True) -> list[list[dict]]:
+        """批量检索：**一次**进读锁，逐条与 `search` 同语义。
+
+        `with_text=False` ⇒ 命中项不带 `text`（评测/管道场景，免掉每命中一条拷一段全文）。
+        `dense` 臂逐条等价 `search(q, dense=True)`。
+        """
+        with self._lock.read():
+            return self._z.query_many(list(qs), k=k, dense=dense, with_text=with_text)
 
     def stats(self) -> dict:
         """索引概览：规模 ＋ 落盘大小 ＋ 开关 ＋ 段/视图计数。"""
@@ -112,8 +122,9 @@ class Index:
             qtoks = zh_tokenize(q)
             s = self._z._score_active(qtoks)
             if docid:
-                rows = [i for i, m in enumerate(self._z._meta)
-                        if docid in (m["file"] or "")]
+                files = self._z._meta.files           # ⭐ X13：只读 file 的扫走紧凑列表
+                rows = [i for i, f in enumerate(files)
+                        if f is not None and docid in f]
                 if not rows:
                     raise KeyError(f"库里没有文件名匹配 {docid!r} 的文档")
                 row = int(max(rows, key=lambda i: float(s[i])))
@@ -488,7 +499,7 @@ class Stage:
     def __init__(self, idx: "Index", tag: str | None = None, generation: str | None = None):
         self.idx = idx
         self.bm = idx.bm
-        self.tag = tag or (time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}")
+        self.tag = tag or _unique_seg_tag(self.idx.dir)   # ⭐ X14：同秒二次发布不撞已 mmap 的段
         self.generation = generation or self.tag
         self.base_V = len(self.bm.idx2term)
         self.base_T_rows = int(self.bm.T.shape[0])

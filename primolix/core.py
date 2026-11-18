@@ -383,6 +383,295 @@ def _topk_idx(x, k):
     return _topk_exact(x, k)
 
 
+class _MetaEntry(dict):
+    """`_meta` 的单条：docid/row/file/line 是真键；`text` 惰性（首次访问才从盘上取）。
+
+    X13（2026-11-18）：[实测] text 占 meta 记录字节的 ~78%，而查询期只有最终 k 条命中
+    才需要它 —— 常驻它 = 白付。`__missing__` 只在 `m['text']` 触发一次并缓存回本条；
+    `get`/`in` 一并覆盖（包内唯一 `.get("text")` 消费点读的是段侧车，不是这里 —— 审计过）。
+    """
+
+    __slots__ = ('_seq', '_i')
+
+    def __init__(self, seq, i, base):
+        super().__init__(base)
+        self._seq = seq
+        self._i = i
+
+    def __missing__(self, key):
+        if key == 'text':
+            t = self._seq._text_at(self._i)
+            self['text'] = t
+            return t
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if key == 'text' and not dict.__contains__(self, 'text'):
+            return self.__missing__('text')
+        return dict.get(self, key, default)
+
+    def __contains__(self, key):
+        if key == 'text':
+            return True                      # 惰性语义：每条必有 text（取的时候才付）
+        return dict.__contains__(self, key)
+
+
+class _MetaSeq:
+    r"""`_meta` 的数组化载体（X13）：docid/row/file/line 常驻，`text` 惰性。
+
+    为什么：[实测] meta 加载的瓶颈是构造 N 个 dict（二进制 v2 只省 9.5% 且不提速，
+    已回退 —— 见 `06_meta格式 §2.5`）；常驻里 text 占 ~78%。本类两件一起解决：
+      · 加载只建数组与紧凑列表（row/line 进 numpy；docid/file 是本来就常驻的身份串）；
+      · `__getitem__` 才按需构造 `_MetaEntry`（查询期只有 k 条命中需要）；
+      · `text` 按行偏移从 `meta.jsonl` 本身取 —— 零格式改动，不碰追加式协议
+        （追加不动旧行 ⇒ 旧偏移恒有效；整份重写后由 `rebind_from_file` 重算）。
+    兼容面：`len/迭代/下标/append` 与旧 list-of-dict 等价；消费方 71 处已逐一核对，
+    只读 row/file 的全表扫全部改走数组直达（`rows` / `files`），点取走 `__getitem__`。
+    """
+
+    __slots__ = ('rows', 'lines', 'docids', 'files', 'texts',
+                 '_toff', '_tpath', '_tfh')
+
+    # ---------------- 构造 ----------------
+    @classmethod
+    def from_dicts(cls, dicts):
+        """从已物化的 dict 列表建（build 路径）：text 直接常驻（写盘后可 `rebind` 转惰性）。"""
+        s = cls.__new__(cls)
+        n = len(dicts)
+        s.rows = np.fromiter((int(d.get('row', -1)) for d in dicts),
+                             dtype=np.int64, count=n)
+        s.lines = np.fromiter((int(d.get('line', 0)) for d in dicts),
+                              dtype=np.int32, count=n)
+        # X14：docids/files/texts 一律 object 数组 —— `_take` 的花式索引是 C 级拷贝
+        s.docids = np.asarray([d.get('docid') for d in dicts], dtype=object)
+        s.files = np.asarray([d.get('file') for d in dicts], dtype=object)
+        s.texts = np.asarray([d.get('text') or '' for d in dicts], dtype=object)
+        s._toff = None
+        s._tpath = None
+        s._tfh = None
+        return s
+
+    @classmethod
+    def from_jsonl(cls, path):
+        """读 `meta.jsonl` → `(seq, 文件里最大 row, 删除记录数)`。
+
+        语义与旧 `_read_meta` 逐条对齐：按 row 建表（后写覆盖先写）、`del` 剔除、
+        按 row 升序；`最大 row` 计所有解析过的行（含被删的 —— 游标语义）。
+        一遍二进制扫描同时拿字段与行偏移；text 字符串不驻留（解析后即弃）。
+        """
+        path = Path(path)
+        rows, lines_, docids, files = [], [], [], []
+        starts, lens = [], []
+        row_to_pos, dels = {}, set()
+        max_row = -1
+        pos = 0
+        with open(path, 'rb') as f:
+            for raw in f:
+                _start, pos = pos, pos + len(raw)
+                ln = raw.strip()
+                if not ln:
+                    continue
+                rec = json.loads(ln.decode('utf-8'))
+                if 'del' in rec:
+                    for r in rec['del']:
+                        dels.add(int(r))
+                    continue
+                r = int(rec.get('row', -1))
+                if r > max_row:
+                    max_row = r
+                rows.append(r)
+                lines_.append(int(rec.get('line', 0)))
+                docids.append(rec.get('docid'))
+                files.append(rec.get('file'))
+                starts.append(_start)
+                lens.append(len(raw))
+                row_to_pos[r] = len(rows) - 1          # 后写覆盖先写
+        order = sorted((r, p) for r, p in row_to_pos.items() if r not in dels)
+        sel = np.fromiter((p for _, p in order), dtype=np.int64,
+                          count=len(order)) if order else np.zeros(0, dtype=np.int64)
+        s = cls.__new__(cls)
+        s.rows = np.asarray(rows, dtype=np.int64)[sel] if len(rows) else np.zeros(0, np.int64)
+        s.lines = np.asarray(lines_, dtype=np.int32)[sel] if len(lines_) else np.zeros(0, np.int32)
+        s.docids = np.asarray(docids, dtype=object)[sel] if rows else np.zeros(0, dtype=object)
+        s.files = np.asarray(files, dtype=object)[sel] if rows else np.zeros(0, dtype=object)
+        s.texts = np.full(len(order), None, dtype=object)     # ⭐ X14：object 数组（惰性占位）
+        s._toff = (np.stack([np.asarray(starts, dtype=np.int64)[sel],
+                             np.asarray(lens, dtype=np.int64)[sel]], axis=1)
+                   if order else np.zeros((0, 2), dtype=np.int64))
+        s._tpath = path
+        s._tfh = None
+        return s, max_row, len(dels)
+
+    # ---------------- 读面 ----------------
+    def __len__(self):
+        return int(self.rows.size)
+
+    def __bool__(self):                        # `(self._meta or [])` 这类写法要它
+        return self.rows.size > 0
+
+    def __getitem__(self, i):
+        i = int(i)
+        base = dict(docid=self.docids[i], row=int(self.rows[i]),
+                    file=self.files[i], line=int(self.lines[i]))
+        return _MetaEntry(self, i, base)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def _text_at(self, i):
+        t = self.texts[i]
+        if t is not None:
+            return t
+        if self._toff is None:
+            raise KeyError("text 无来源：载体既无常驻 text 也无文件偏移（from_dicts 后未 rebind？）")
+        s, n = int(self._toff[i, 0]), int(self._toff[i, 1])
+        if s < 0:
+            raise KeyError("该条目无文件偏移且无常驻 text —— 结构性不一致（垫行被走到 = bug）")
+        if self._tfh is None:
+            self._tfh = open(self._tpath, 'rb')
+        self._tfh.seek(s)
+        rec = json.loads(self._tfh.read(n).decode('utf-8'))
+        t = rec.get('text') or ''
+        self.texts[i] = t
+        return t
+
+    def bulk_text_load(self):
+        r"""把所有惰性 text **按文件序**一次读出并缓存（整份重写 / dense 编码等全量消费者用）。
+
+        按偏移排序后 seek 单调 ⇒ 实际顺序读；随机逐条 fetch 在 1M 上会慢好几倍。
+        """
+        need = [i for i, t in enumerate(self.texts)
+                if t is None and self._toff is not None and int(self._toff[i, 0]) >= 0]
+        if not need:
+            return
+        need.sort(key=lambda i: int(self._toff[i, 0]))
+        with open(self._tpath, 'rb') as f:
+            for i in need:
+                s, n = int(self._toff[i, 0]), int(self._toff[i, 1])
+                f.seek(s)
+                rec = json.loads(f.read(n).decode('utf-8'))
+                self.texts[i] = rec.get('text') or ''
+
+    def rebind_from_file(self, path):
+        r"""整份重写 `meta.jsonl` 之后必须重绑：从**新文件**重算行偏移，text 恢复惰性。
+
+        不重绑 = 旧偏移指向新文件里的错行 —— 静默取错 text，属最危险的一类错。
+        新文件由 `_write_meta_full` 逐条写出 ⇒ 第 i 行 ⇔ 第 i 条，映射天然 1:1。
+        """
+        path = Path(path)
+        buf = path.read_bytes()                    # ⚠️ 瞬时一份全文（重写路径本来就重）
+        if buf:
+            nl = np.frombuffer(buf, dtype=np.uint8) == 10
+            ends = np.flatnonzero(nl)
+            if ends.size and ends[-1] != len(buf) - 1:
+                ends = np.concatenate([ends, [len(buf) - 1]])
+            elif not ends.size:
+                ends = np.asarray([len(buf) - 1])
+            starts = np.concatenate([[0], (ends[:-1] + 1)]).astype(np.int64)
+            lens = (ends - starts + 1).astype(np.int64)
+            self._toff = np.stack([starts, lens], axis=1)
+        else:
+            self._toff = np.zeros((0, 2), dtype=np.int64)
+        self._tpath = path
+        self.texts = np.full(len(self), None, dtype=object)
+        if self._tfh is not None:                  # 旧句柄指向旧 inode 内容，重开
+            self._tfh.close()
+            self._tfh = None
+
+    # ---------------- 写面（列表手术的等价原语） ----------------
+    def append(self, d):
+        self.rows = np.concatenate([self.rows, [int(d.get('row', -1))]])
+        self.lines = np.concatenate([self.lines, [int(d.get('line', 0))]])
+        # X14：object 数组上的追加也是 numpy 拼接（小量 O(1) 级）
+        self.docids = np.concatenate([self.docids, np.asarray([d.get('docid')], dtype=object)])
+        self.files = np.concatenate([self.files, np.asarray([d.get('file')], dtype=object)])
+        self.texts = np.concatenate([self.texts, np.asarray([d.get('text') or ''], dtype=object)])
+        # 不变量：`_toff` 与条目等长（无文件来源的行垫 -1）。
+        #    追加不动旧行 ⇒ 旧偏移天然有效；新条目 text 已就位 ⇒ -1 行永远不会被读。
+        if self._toff is not None:
+            self._toff = np.concatenate(
+                [self._toff, np.full((1, 2), -1, dtype=np.int64)])
+
+    def filter_by_file(self, drop_rels):
+        r"""一次 `np.isin` 同时给出 `(保留载体, 墓碑位置)`。
+
+        X14：旧实现在调用方再做一趟 Python 循环取墓碑（两趟 O(N)）；isin 在
+        object 数组上是 C 循环，@1M 一趟 ≈40 ms。顺序保持；`_toff` 同步切片 ⇒ 偏移仍对齐。
+        """
+        drop = list(drop_rels) if drop_rels else []
+        if drop:
+            mask = np.isin(self.files, np.asarray(drop, dtype=object))
+        else:
+            mask = np.zeros(len(self), dtype=bool)
+        tomb = np.flatnonzero(mask)
+        keep = np.flatnonzero(~mask)
+        return self._take(keep), tomb
+
+    def with_appended(self, dicts):
+        r"""**就地**追加并返回自身（X14）。
+
+        语义变化：不再复制整个载体（旧版 `_take(全量)` 在 @1M 是 0.5 s 的纯浪费——
+        cProfile 抓到的主犯）。调用方不得再持有旧引用（update 的用法正是如此）。
+        需要保留旧载体时用 `merged_sorted_by_row`（它显式走 numpy 廉价的 `_take` 拷贝）。
+        """
+        for d in dicts:
+            self.append(d)
+        return self
+
+    def merged_sorted_by_row(self, add_dicts):
+        """`sorted(本载体 + add, key=row)` 的等价（add 的行号不在本载体里 —— 调用方保证）。
+
+        本方法不就地：先 `_take(全量)`（numpy 花式索引，@1M ≈20 ms）再追加排序。
+        """
+        n = len(self)
+        s = self._take(np.arange(n, dtype=np.int64))
+        for d in add_dicts:
+            s.append(d)
+        order = np.argsort(s.rows, kind='stable')
+        return s._take_order(order)
+
+    def entries_in_row_range(self, lo, hi):
+        """`lo <= row < hi` 的条目（物化成 dict；折叠写 delta 的 meta_rows 用）。"""
+        sel = np.flatnonzero((self.rows >= lo) & (self.rows < hi))
+        return [self[int(i)] for i in sel]
+
+    def rows_where_row_ge(self, floor, top=None):
+        """行号 ∈ [floor, top) 的下标（追加游标判定用；只碰数组，不物化）。"""
+        m = self.rows >= floor
+        if top is not None:
+            m &= self.rows < top
+        return np.flatnonzero(m).tolist()
+
+    # ---------------- 内部 ----------------
+    def _take(self, keep):
+        keep = np.asarray(keep, dtype=np.int64)
+        s = _MetaSeq.__new__(_MetaSeq)
+        # X14：全 numpy 花式索引 —— @1M 的 C 级拷贝，替代旧的逐元素列表重建
+        s.rows = self.rows[keep]
+        s.lines = self.lines[keep]
+        s.docids = self.docids[keep]
+        s.files = self.files[keep]
+        s.texts = self.texts[keep]
+        s._toff = (self._toff[keep] if self._toff is not None else None)
+        s._tpath = self._tpath
+        s._tfh = self._tfh                     # 共享只读句柄（关闭责任在旧载体 GC）
+        return s
+
+    def _take_order(self, order):
+        order = np.asarray(order, dtype=np.int64)
+        s = _MetaSeq.__new__(_MetaSeq)
+        s.rows = self.rows[order]
+        s.lines = self.lines[order]
+        s.docids = self.docids[order]
+        s.files = self.files[order]
+        s.texts = self.texts[order]
+        s._toff = (self._toff[order] if self._toff is not None else None)
+        s._tpath = self._tpath
+        s._tfh = self._tfh
+        return s
+
+
 class Primolix:
     """零编码检索索引的 Python API：`build` / `query` / `browse` / `update` / `info`。
 
@@ -407,6 +696,8 @@ class Primolix:
         self._vecs = None
         self._dense = dense
         self._model_path = model_path
+        self.load_report = None            # ⭐ X13：`_load` 后填（delta 回放 applied/stopped/error）
+        self._hash_events_n = 0            # ⭐ X14：hashes.jsonl 未压实的事件数（加载时重数）
 
     # ---------- 建索引 ----------
 
@@ -437,7 +728,7 @@ class Primolix:
         _say("构建 BM25 词表...")
         self._bm = SparseBM25([c['text'] for c in chunks], zh_tokenize,
                               workers=workers, stream=self._stream)
-        self._meta = chunks
+        self._meta = _MetaSeq.from_dicts(chunks)      # ⭐ X13：数组化载体（text 暂常驻，落盘后转惰性）
         self._rows = None
         self._hashes = {rel: h for rel, h, _ in files}
         self._stamps = _stamps          # size/mtime 印记：下一次 update 可走 stat 快扫
@@ -583,17 +874,43 @@ class Primolix:
                 pass
         return n
 
-    def _write_hashes(self):
-        """只写 `hashes.json`（v2 格式，含 size/mtime 快扫印记）。"""
-        doc = {"v": 2,
-               "hashes": self._hashes or {},
-               "stamps": {k: [int(v[0]), int(v[1])]
-                          for k, v in (getattr(self, "_stamps", None) or {}).items()}}
-        with open(self.dir / 'hashes.json', 'w', encoding='utf-8') as f:
-            json.dump(doc, f, ensure_ascii=False, indent=1)
+    def _write_hashes(self, events=None):
+        r"""写哈希账本：默认**追加事件**（`hashes.jsonl`，O(改动)）；`events=None` ⇒ 整份快照。
 
-    def _persist_under_segments(self, del_rows=None):
-        """段在场时的落盘：`meta.jsonl`（**只写主表行**）＋ `hashes.json`，⛔ 不动 `bm25.npz`。
+        X14（2026-11-18）：增量收尾不再整份重写 `hashes.json`（@20k 文件 ≈140 ms/次，
+        delta 落盘之后残存的最后一个整份重写）。设计照抄 `meta.jsonl` 追加式的先例：
+          · 事件行：`{"rel":..., "md5":..., "stamp":[size, mtime_ns]}` / `{"del": rel}`；
+          · 加载 = 快照（v2 不变，旧读方照常）＋ 事件回放（`_load`）；
+          · 事件攒过 `HASHES_COMPACT_N` 条 → 快照整理一次并清日志。
+        `stamps` 是 `verify="stat"` 快扫的物理前提 ⇒ 事件必须同步带 stamp。
+        """
+        if events is None:
+            doc = {"v": 2,
+                   "hashes": self._hashes or {},
+                   "stamps": {k: [int(v[0]), int(v[1])]
+                              for k, v in (getattr(self, "_stamps", None) or {}).items()}}
+            with open(self.dir / 'hashes.json', 'w', encoding='utf-8') as f:
+                json.dump(doc, f, ensure_ascii=False, indent=1)
+            (self.dir / 'hashes.jsonl').unlink(missing_ok=True)   # 快照即全量 ⇒ 清事件日志
+            self._hash_events_n = 0
+            return
+        n_ev = 0
+        with open(self.dir / 'hashes.jsonl', 'a', encoding='utf-8') as f:
+            for ev in events:
+                if ev[0] == 'del':
+                    f.write(json.dumps({"del": ev[1]}, ensure_ascii=False) + '\n')
+                else:
+                    _, rel, md5, stamp = ev
+                    sz, mt = (int(stamp[0]), int(stamp[1])) if stamp else (0, 0)
+                    f.write(json.dumps({"rel": rel, "md5": md5, "stamp": [sz, mt]},
+                                       ensure_ascii=False) + '\n')
+                n_ev += 1
+        self._hash_events_n = int(getattr(self, "_hash_events_n", 0) or 0) + n_ev
+        if self._hash_events_n > HASHES_COMPACT_N:
+            self._write_hashes()                                  # 攒多了 → 快照整理
+
+    def _persist_under_segments(self, del_rows=None, events=None):
+        """段在场时的落盘：`meta.jsonl`（**只写主表行**）＋ 哈希账本，⛔ 不动 `bm25.npz`。
 
         为什么不能直接 `_persist()`：它内含 `SparseBM25.save()`，而 `save()` 在段在场时
         直接抛错（挂段是内存视图，写出的 npz 会与 `dl`/`T` 不一致）。
@@ -604,15 +921,22 @@ class Primolix:
         """
         seg_floor = int(self._bm.T.shape[0])
         self._meta_append_pending(del_rows=del_rows, ceiling=seg_floor)
-        self._write_hashes()
+        self._write_hashes(events=events)    # ⭐ X14：None ⇒ 整份（旧路径），events ⇒ 追加
 
     # ---------- L2：增量持久化（delta 日志） ----------
 
     def _write_meta_full(self):
-        """整份重写 `meta.jsonl`（全部活跃 chunk）。⛔ 不写 npz —— 构建/压实用它。"""
+        """整份重写 `meta.jsonl`（全部活跃 chunk）。⛔ 不写 npz —— 构建/压实用它。
+
+        X13：text 惰性载体下重写两步走 —— 先 `bulk_text_load()`（按文件序一次取回，
+        免掉 1M 次随机小读），写完 `rebind_from_file()` 从新文件重算行偏移、
+        text 恢复惰性（不重绑 = 旧偏移指向新文件的错行，静默取错 text —— 最危险的一类错）。
+        """
+        self._meta.bulk_text_load()
         with open(self.dir / 'meta.jsonl', 'w', encoding='utf-8') as f:
             for c in self._meta:
                 f.write(json.dumps(c, ensure_ascii=False) + '\n')
+        self._meta.rebind_from_file(self.dir / 'meta.jsonl')
         self._persisted_N = int(self._bm.N) if self._bm is not None else 0
         self._meta_dels = 0
 
@@ -629,9 +953,9 @@ class Primolix:
         bm = self._bm
         floor = int(getattr(self, '_persisted_N', 0) or 0)
         top = int(ceiling) if ceiling is not None else None
-        added = [c for c in self._meta
-                 if int(c.get('row', -1)) >= floor
-                 and (top is None or int(c.get('row', -1)) < top)]
+        # X13：只读 row 的全表扫改走数组直达（旧实现逐条取 dict['row']，
+        #    惰性载体下那会物化 1M 个 dict —— 白付）
+        added = [self._meta[int(i)] for i in self._meta.rows_where_row_ge(floor, top)]
         dels = [int(r) for r in (del_rows if del_rows is not None else [])]
         if not added and not dels:
             return dict(added=0, dels=0, bytes=0)
@@ -713,7 +1037,7 @@ class Primolix:
 
     def _merge_meta(self, parts) -> int:
         """把 delta 带来的文档身份并进 `_meta`（按 `row` 去重；⛔ 墓碑行不复活）。"""
-        have = {int(c.get('row', -1)) for c in self._meta}
+        have = {int(r) for r in self._meta.rows.tolist()}        # ⭐ X13：数组直达
         dead = getattr(self._bm, '_dead', None)
         n_lim = int(self._bm.N)
         add = []
@@ -729,7 +1053,7 @@ class Primolix:
             have.add(r)
             add.append(c)
         if add:
-            self._meta = sorted(self._meta + add, key=lambda c: int(c.get('row', -1)))
+            self._meta = self._meta.merged_sorted_by_row(add)
             self._rows = None
         return len(add)
 
@@ -833,30 +1157,18 @@ class Primolix:
         return dict(applied=applied, stopped=stopped)
 
     def _read_meta(self):
-        """读 `meta.jsonl`（支持追加式的 `{"del": [row…]}` 记录）。
+        r"""读 `meta.jsonl`（支持追加式的 `{"del": [row…]}` 记录）→ `(_MetaSeq, 最大row, 删除数)`。
 
-        返回 `(entries, 文件里最大 row, 删除标记数)`。
-        2026-11-11：二进制 v2（`meta.bin` ＋ 定长记录）实现过并回退了 ——
-        10 万条只省 9.5%、加载不变快（瓶颈是构造 dict，不是解析），不值得多维护一套格式。
-        见 `06_meta格式_设计与判据_2026-11-11.md §2.5`。
+        X13（2026-11-18）：返回数组化载体，不再构造 N 个 dict —— [实测] 那是加载瓶颈
+        （二进制 v2 的教训：解析不是大头，dict 构造才是；见 `06_meta格式 §2.5`）。
+        text 惰性：按行偏移从本文件取（`_MetaSeq._text_at`），零格式改动。
+        遗留字段 `chunk_id` 不再进载体（包内无人写它；唯一读点 `load_views` 的兜底
+        同步改为只认 `docid` —— 0.1 之前的古索引才可能只有 chunk_id）。
         """
         path = self.dir / 'meta.jsonl'
         if not path.exists():
-            return [], -1, 0
-        by_row, dels = {}, set()
-        with open(path, encoding='utf-8') as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                rec = json.loads(ln)
-                if 'del' in rec:
-                    for r in rec['del']:
-                        dels.add(int(r))
-                    continue
-                by_row[int(rec.get('row', -1))] = rec
-        out = [c for r, c in sorted(by_row.items()) if r not in dels]
-        return out, (max(by_row) if by_row else -1), len(dels)
+            return _MetaSeq.from_dicts([]), -1, 0
+        return _MetaSeq.from_jsonl(path)
 
     def _load(self):
         # 索引目录含 dense.npy → 视为 dense 索引 (update/reload 保持 dense 一致)
@@ -878,11 +1190,33 @@ class Primolix:
         else:                                                # 旧格式：rel → md5，无快扫印记
             self._hashes = doc or {}
             self._stamps = {}
+        # X14：回放哈希事件日志（若有）—— 追加式的对账点在加载侧，快照 v2 不动。
+        self._hash_events_n = 0
+        evp = self.dir / 'hashes.jsonl'
+        if evp.exists():
+            with evp.open(encoding='utf-8') as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    rec = json.loads(ln)
+                    if 'del' in rec:
+                        self._hashes.pop(rec['del'], None)
+                        self._stamps.pop(rec['del'], None)
+                    else:
+                        self._hashes[rec['rel']] = rec['md5']
+                        self._stamps[rec['rel']] = (int(rec['stamp'][0]), int(rec['stamp'][1]))
+                    self._hash_events_n += 1
         # L2：回放 delta 日志（若有）。必须在挂段之前 —— 段的 row_base 依赖 `bm.N`。
+        rep = dict(applied=0, stopped=0, error=None)
         try:
-            self._replay_deltas()
+            rep.update(self._replay_deltas() or {})
         except Exception as _e:                              # noqa: BLE001
+            rep['error'] = repr(_e)
             _say(f"[警告] delta 回放失败（{_e!r}）→ 按 npz 状态可用，但最近的增量可能缺失")
+        # X13：回放报告常驻（`info['load_report']`）——「最近增量缺失」必须可观测，
+        #    这是 `PERSIST_MODE` 翻默认前的安全前提（吞成 stderr 警告 = 静默偏差）。
+        self.load_report = rep
         self._vecs = None
         if self._dense:
             f = self.dir / 'dense.npy'
@@ -919,7 +1253,8 @@ class Primolix:
         `_vecs` 与 `_meta` 逐位对齐 ⇒ 追加后长度不符就必须弃用 dense并如实告警。
         """
         added = skipped = 0
-        have = {int(m.get("row", -1)) for m in (self._meta or [])}
+        have = ({int(r) for r in self._meta.rows.tolist()}
+                if self._meta is not None else set())            # ⭐ X13：数组直达
         segs = getattr(self._bm, "_segments", None) or {}
         for r in mounted or []:
             if not r.get("mounted"):
@@ -961,6 +1296,7 @@ class Primolix:
         if model is None:
             return
         t0 = time.time()
+        self._meta.bulk_text_load()          # ⭐ X13：dense 编码要全部正文 —— 按文件序一次取回
         vecs = model.encode([c['text'] for c in self._meta], batch_size=16,
                             normalize_embeddings=True, convert_to_numpy=True,
                             show_progress_bar=True).astype('float32')
@@ -981,7 +1317,8 @@ class Primolix:
                     V=int(self._bm.V), nnz=int(self._bm.nnz),
                     size_mb=round(bm_path.stat().st_size / 1e6, 2) if bm_path.exists() else 0.0,
                     dense=(self._vecs is not None),
-                    files=len(self._hashes))
+                    files=len(self._hashes),
+                    load_report=getattr(self, 'load_report', None))
 
     # ---------- 检索 ----------
 
@@ -993,7 +1330,8 @@ class Primolix:
         """
         if self._rows is None:
             n = len(self._meta)
-            self._rows = (np.fromiter((c['row'] for c in self._meta), dtype=np.int64, count=n)
+            # X13：`rows` 就是数组 —— `.copy()` 保住「重建必出新对象」的失效纪律
+            self._rows = (self._meta.rows.copy()
                           if n else np.zeros(0, dtype=np.int64))
             # 01m：顺手判「恒等」（`_meta` 的行号恰是 `0..N-1` 且与物理行一一对应）。
             #    判一次 O(n)（只在这条缓存重建时付）；此后 `_score_active` 每查询免掉
@@ -1061,6 +1399,35 @@ class Primolix:
                             file=m['file'], line=m['line'], text=m['text']))
         return out
 
+    def query_many(self, qs, k=10, dense=False, with_text=True):
+        r"""批量查询（X12）：逐条复用 `query` 的内部步骤，给评测/管道一条少付门面税的路。
+
+        与逐条 `query` 的语义差别只有一处：`with_text=False` 时命中项不带 `text`
+        （省掉每命中一条拷一段全文；其余字段与 `query` 完全同名同值）。
+        `dense` 臂逐条委托 `query(dense=True)`，不做任何批内特殊化。
+        """
+        if self._bm is None:
+            self._load()
+        out_all = []
+        for q in qs:
+            if dense:
+                out_all.append(self.query(q, k=k, dense=True))
+                continue
+            s = self._score_active(zh_tokenize(q))
+            order = _topk_idx(s, k)
+            out = []
+            for rank, i in enumerate(order, 1):
+                if s[i] <= 0:
+                    break
+                m = self._meta[int(i)]
+                d = dict(rank=rank, score=float(s[i]), docid=m.get('docid'),
+                         file=m['file'], line=m['line'])
+                if with_text:
+                    d['text'] = m['text']
+                out.append(d)
+            out_all.append(out)
+        return out_all
+
     # ---------- 浏览 ----------
 
     def browse(self, file=None, page=0, n=20):
@@ -1068,8 +1435,9 @@ class Primolix:
             self._load()
         if file is not None:
             file_n = file.replace('\\', '/')
-            idxs = [i for i, m in enumerate(self._meta)
-                    if m['file'].replace('\\', '/') == file_n]
+            # X13：只读 file 的全表扫走紧凑列表，不物化 dict
+            idxs = [i for i, f in enumerate(self._meta.files)
+                    if f is not None and f.replace('\\', '/') == file_n]
         else:
             idxs = list(range(len(self._meta)))
         start = page * n
@@ -1080,7 +1448,7 @@ class Primolix:
     def list_files(self):
         if self._meta is None:
             self._load()
-        return sorted({m['file'] for m in self._meta})
+        return sorted(set(self._meta.files))          # ⭐ X13：files 是紧凑 str 列表
 
     # ---------- 真增量 update（方案 A） ----------
 
@@ -1131,8 +1499,7 @@ class Primolix:
             if persist == "delta":
                 _n1 = int(bm.N)
                 self._persist_delta(range(n0, _n1), [],
-                                    meta_rows=[c for c in self._meta
-                                               if n0 <= int(c.get('row', -1)) < _n1])
+                                    meta_rows=self._meta.entries_in_row_range(n0, _n1))
                 self._meta_append_pending()        # ⭐ 追加式：折出来的行是新的尾部
                 self._write_hashes()
             else:
@@ -1205,9 +1572,10 @@ class Primolix:
                                           file=rel, line=ln, text=t))
 
         # ---- 墓碑/保留：整文件级替换（removed + changed 的旧 chunk 全剔除） ----
+        # X14：`filter_by_file` 一次 isin 同时给保留集与墓碑位置（旧版两趟 O(N) Python 循环）
         drop_rels = set(removed) | set(changed)
-        tomb_rows = [c['row'] for c in self._meta if c['file'] in drop_rels]
-        keep_meta = [c for c in self._meta if c['file'] not in drop_rels]
+        keep_meta, _tomb_pos = self._meta.filter_by_file(drop_rels)
+        tomb_rows = self._meta.rows[_tomb_pos].tolist()
         # 行号 ≥ T 行数 ⇒ 该行落在段里（段内不支持删除）—— 与"这批带不带新词"无关
         seg_floor = int(self._bm.T.shape[0])
         n_tomb_seg = sum(1 for r in tomb_rows if int(r) >= seg_floor)
@@ -1267,7 +1635,7 @@ class Primolix:
                         continue
                     new_pos[t] = base_V + len(new_terms)
                     new_terms.append(t)
-            tag = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+            tag = _unique_seg_tag(self.dir)   # ⭐ X14：秒级 tag 在同秒二次发布时会撞已 mmap 的段文件
             if tomb_rows:
                 self._bm._tombstone_rows(tomb_rows)
             self._meta = keep_meta
@@ -1280,7 +1648,10 @@ class Primolix:
             self._hashes = new
             self._stamps = {rel: stamps_now[rel] for rel in new if rel in stamps_now}
             # 段在场 ⇒ `_persist()` 里的 `bm.save()` 会抛错：只落 meta(主表行)＋hashes。
-            self._persist_under_segments(del_rows=tomb_rows)
+            _hev = [("del", rel) for rel in removed]           # ⭐ X14：哈希账本同样追加化
+            _hev += [("set", rel, new[rel], stamps_now.get(rel))
+                     for rel in list(changed) + list(added)]
+            self._persist_under_segments(del_rows=tomb_rows, events=_hev)
             _say(f"S4 挂段完成 {time.time() - t0:.0f}s (新词 {len(oov)}, 段 {out['tag']}, "
                   f"墓碑 {len(tomb_rows)} 行, 活跃 {len(self._meta)})")
             return {'kind': 'staged',
@@ -1295,15 +1666,19 @@ class Primolix:
         new_rows = self._bm.append_docs(chunk_tokens)
         for c, row in zip(append_chunks, new_rows):
             c['row'] = int(row)
-        self._meta = keep_meta + append_chunks
+        self._meta = keep_meta.with_appended(append_chunks)   # ⭐ X13：数组化载体的列表手术等价
         self._rows = None          # ⭐ 失效行号缓存（行号已迁移/追加）
         self._hashes = new
         self._stamps = {rel: stamps_now[rel] for rel in new if rel in stamps_now}
+        # X14：哈希账本追加化 —— 只记 touched（removed/changed/added），不再整份重写
+        _hev = [("del", rel) for rel in removed]
+        _hev += [("set", rel, new[rel], stamps_now.get(rel))
+                 for rel in list(changed) + list(added)]
         # 持久化分档（L2）：delta 模式只写 O(新 nnz)，npz 模式维持原行为
         if PERSIST_MODE == "delta":
             dinfo = self._persist_delta(new_rows, tomb_rows, meta_rows=append_chunks)
             self._meta_append_pending(del_rows=tomb_rows)   # ⭐ 追加式：O(新增行)，不重写整份
-            self._write_hashes()
+            self._write_hashes(events=_hev)
             persist_note = f"delta#{dinfo['seq']}({dinfo['nnz']} nnz)"
             cauto = self._maybe_compact_delta()          # L2/S3：两层压实
             if cauto:
@@ -1367,7 +1742,7 @@ class Primolix:
             raise ValueError(f"meta_positions 越界（活跃 chunk 数={len(self._meta)}）")
         if len(set(pos.tolist())) != pos.size:
             raise ValueError("meta_positions 有重复 —— 一个 chunk 至多一个向量")
-        rows = np.asarray([int(self._meta[i]["row"]) for i in pos], dtype=np.int64)
+        rows = self._meta.rows[pos]           # ⭐ X13：数组直达（物化 1M 个 dict 的旧写法已废）
         m = dict(meta or {})
         m.setdefault("n_active", len(self._meta))
         m.setdefault("covered", int(pos.size))
@@ -1399,8 +1774,7 @@ class Primolix:
         cov = np.zeros(len(self._meta), dtype=bool)
         if len(self._meta) == 0 or rows.size == 0:
             return cov
-        meta_rows = np.asarray([int(m["row"]) for m in self._meta], dtype=np.int64)
-        hit = np.isin(meta_rows, rows)
+        hit = np.isin(self._meta.rows, rows)      # ⭐ X13：数组直达
         cov[hit] = True
         return cov
 
@@ -1411,7 +1785,7 @@ class Primolix:
         base = self._bm.fused_scores(qtoks, qvec, view_name, alpha=alpha)
         if len(self._meta) == 0:
             return base
-        rows = np.asarray([m["row"] for m in self._meta], dtype=np.int64)
+        rows = self._meta.rows                     # ⭐ X13：数组直达
         return base[rows].astype(np.float32)
 
     def save_view(self, name, docids, vectors, meta=None):
@@ -1459,10 +1833,9 @@ class Primolix:
                         seen.add(key)
                         sidecars.append(f)
         pos_of = {}
-        for i, m in enumerate(self._meta):
-            key = m.get("docid") or m.get("chunk_id")
-            if key is not None and key not in pos_of:
-                pos_of[key] = i
+        for i, did in enumerate(self._meta.docids):     # ⭐ X13：数组直达（chunk_id 兜底废止，见 _read_meta）
+            if did is not None and did not in pos_of:
+                pos_of[did] = i
         for f in sidecars:
             try:
                 z = np.load(f, allow_pickle=False)
@@ -1495,18 +1868,38 @@ class Primolix:
 
 SEG_SUBDIR = ".segments"
 SEG_MANIFEST = "manifest.jsonl"
+
+
+def _unique_seg_tag(index_dir, base=None) -> str:
+    r"""段 tag 唯一化（X14，2026-11-18 修）。
+
+    事故形态：`%Y%m%d-%H%M%S` 是秒级的 —— 同一进程在同一秒内做两次 staged
+    发布（小语料/脚本化灌入完全做得到）⇒ 两次拿到同一个 tag ⇒ 第二次去
+    `np.save` 已被 `mount_segment` mmap 的段文件 ⇒ Windows 拒绝改写活动映射
+    ⇒ `OSError(22)`，且看起来像"路径非法"（本测试第一版就是被它咬的）。
+    修法：目录已存在就顺序加 `-2/-3/…` 后缀；manifest 的唯一性语义不变。
+    跨进程本就带 PID ⇒ 不会撞；同进程的 TOCTOU 窗口在此形态下不存在（串行发布）。
+    """
+    base = base or (time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}")
+    tag, k = base, 1
+    while (Path(index_dir) / SEG_SUBDIR / tag).exists():
+        k += 1
+        tag = f"{base}-{k}"
+    return tag
 # 段级文档身份侧车（乙档）：一行一篇 `{docid,row,file,line,text}`，与段同生共死。
 #    （写到一半崩 ⇒ 历史身份全丢）。侧车是 append-only 的，且先于 manifest 提交写好。
 SEG_DOCS = "docs.jsonl"
 
 # ================================================================ L2：增量持久化开关
-# "npz"（默认）＝每次 `_persist()` 重写整份 npz（0.2.1 及以前的行为）；
-# "delta"     ＝平时只写 `delta/<seq>.npz`（O(新 nnz)），`_persist()` 只在压实时发生。
-# 默认仍是 "npz"：S1 只加分支，现网行为一字不变。切换默认要等 L2-1…L2-5 全过。
-PERSIST_MODE = "npz"
+# "npz"     ＝每次 `_persist()` 重写整份 npz（0.2.1 及以前的行为）；
+# "delta"   ＝平时只写 `delta/<seq>.npz`（O(新 nnz)），`_persist()` 只在压实时发生。
+#   一次增量 update ≈0.5–0.7s（大头 stat 扫）· tier-1 压实 197ms · tier-2 全量 2.51s
+#   回放 0.31s/delta 文件（⇒ MAX_FILES=16 最坏冷启罚 ≈5s）· `info['load_report']` 可观测。
+PERSIST_MODE = "delta"
 DELTA_SUBDIR = ".delta"
 DELTA_COMPACT_RATIO = 0.3        # `[提案]`：Σdelta.nnz > 0.3 × base.nnz 就该压实
-DELTA_MAX_FILES = 32             # `[提案]`：delta 文件数上限（加载要逐个回放）
+DELTA_MAX_FILES = 16             # ⭐ 0.2.4：32→16（回放罚 0.31s/文件 ⇒ 16 最坏 ≈5s 冷启）
+HASHES_COMPACT_N = 4096          # ⭐ X14：hashes 事件攒过这条数就快照整理（同 meta 的 4096 先例）
 
 
 def set_persist_mode(mode: str) -> str:

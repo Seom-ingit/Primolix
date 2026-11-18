@@ -5,7 +5,8 @@
 Run:  python tests/test_delta_persist.py
 
 判据（对应 05_L2 的 L2-1 / L2-2 / L2-3 / L2-4）：
-  D1 npz 模式（默认）：一次增量后 npz **被重写**、`.delta/` 不存在
+  D0 发布决策守卫：默认 PERSIST_MODE="delta"、DELTA_MAX_FILES=16（0.2.4 裁定）
+  D1 npz 模式（**显式**设定）：一次增量后 npz **被重写**、`.delta/` 不存在
   D2 delta 模式：一次增量后 npz **一个字节不动**、`.delta/` 多一个文件（L2-2 的形态）
   D3 回放逐位：重载后的分数与内存逐位相同、`_meta` 条数相同（L2-1）
   D4 两个 delta 链式回放（L2-1）
@@ -60,7 +61,13 @@ def main() -> int:
     npz = idx / "bm25.npz"
 
     try:
-        # ---- D1：npz 模式（默认）----
+        # ---- D0：发布决策守卫（0.2.4：默认翻 delta ＋ MAX_FILES 32→16）----
+        check("D0 release guard: default PERSIST_MODE='delta', DELTA_MAX_FILES=16",
+              core.PERSIST_MODE == "delta" and core.DELTA_MAX_FILES == 16,
+              f"PERSIST_MODE={core.PERSIST_MODE!r} · MAX_FILES={core.DELTA_MAX_FILES}")
+
+        # ---- D1：npz 模式（显式设定；0.2.4 起默认是 delta）----
+        core.set_persist_mode("npz")
         (root / "c.txt").write_text("kernel retrieval kernel retrieval\n" * 3, encoding="utf-8")
         m0 = (npz.stat().st_size, npz.stat().st_mtime_ns)
         rep1 = z.update(str(root))
@@ -226,7 +233,7 @@ def main() -> int:
               f"首行未变={_lines[0] == _first} · 增长={_mf.stat().st_size - _size}B"
               f" · meta {len(z._meta)} → {len(z12._meta)} · max|d|={d12:.3e}")
     finally:
-        core.set_persist_mode("npz")
+        core.set_persist_mode("delta")     # ⭐ 0.2.4 起默认是 delta（进程态还原到默认）
         shutil.rmtree(work, ignore_errors=True)
 
     print("-" * 60)

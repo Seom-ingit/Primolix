@@ -1963,14 +1963,13 @@ class SparseBM25:
                     bm._dead = np.array(np.load(_pd, mmap_mode="r"), dtype=bool, copy=True)
                 #  `df` 仍来自 npz：`_tombstone_rows` 会原地写它（只读 mmap 会当场报错）
                 bm.df = z['df'].astype(np.int32) if 'df' in z else None
-                if cls.EAGER_TC and not cls.TC_SHARED:
-                    bm._tc_blocks = [(bm.T.tocsc(), 0)]
-                    bm._tc_rows = int(Tshape[0])
-                    log("S1 postings 走 mmap · CSC eager")
-                else:
-                    log("S1 postings 走 mmap · CSC 推到首查"
-                        + ("（TC_SHARED → 首查时发布/attach 共享段）" if cls.TC_SHARED
-                           else "（EAGER_TC=False）"))
+                #    eager `tocsc()` —— 那是一次 O(nnz) 拷贝（@1M ≈330 MB + ~0.5 s），
+                #    会把 mmap 的懒页当场全部打穿，冷启仍是 O(nnz)。
+                #    CSC 改由首查的 `_ensure_tc()` 补建（空块 → 全量 tocsc，见
+                #    `_ensure_tc_locked`；@1M ≈0.5 s，一次性）。
+                #    `EAGER_TC` 开关继续管 npz 直读路径（那条本来就已付 nnz 读取）。
+                log("S1 postings 走 mmap · CSC 推到首查（.mm 在场 ⇒ 加载期不碰 postings 页）"
+                    + ("（TC_SHARED → 首查时发布/attach 共享段）" if cls.TC_SHARED else ""))
             else:
                 bm.T = csr_matrix((z['T_data'], z['T_idx'], z['T_ptr']), shape=Tshape)
                 bm._tc_blocks = [(bm.T.tocsc(), 0)]
