@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import hashlib
 import math  # noqa: F401
 import multiprocessing
@@ -24,7 +26,7 @@ except ImportError:  # pragma: no cover - 仅当 scipy 缺失时
 
 LOG_PATH = None
 
-# 0.2.3：npz 的压缩档位（zipfile.compresslevel）。`np.savez_compressed` 固定用 zlib 默认的 6 级，
+# ⭐ 0.2.3：npz 的压缩档位（zipfile.compresslevel）。`np.savez_compressed` 固定用 zlib 默认的 6 级，
 #    在 1M 上占全量落盘 22.6 s 里的绝大部分。降到 1 级能把这笔砍掉约 4/5，体积涨 20–30%。
 #    0 ⇒ 完全不压（ZIP_STORED，写 335 MB 只要 0.36 s，但盘上四倍大）。
 NPZ_COMPRESS_LEVEL = 1
@@ -38,8 +40,8 @@ def set_npz_level(level: int) -> int:
     return old
 
 
-# 0.2.3：`.mm/` 侧车（`T_data/T_idx/T_ptr` 的裸 `.npy`，供 mmap）是否随落盘写出。
-#    `True`  ⇒ 冷启可 mmap，代价是多写一份 nnz×4 B（1M ≈ 165.6 MB，≈2 s）。
+# ⭐ 0.2.3：`.mm/` 侧车（`T_data/T_idx/T_ptr` 的裸 `.npy`，供 mmap）是否随落盘写出。
+#    `True`  ⇒ 冷启可 mmap，代价是**多写一份 nnz×4 B**（1M ≈ 165.6 MB，≈2 s）。
 #    `False` ⇒ 省掉那 2 s，冷启退化成从 npz 解压（正确性不变，`.mm/` 的世代键会拒用陈旧件）。
 MM_SIDECAR = True
 
@@ -52,9 +54,9 @@ def set_mm_sidecar(on: bool) -> bool:
     return old
 
 
-# 0.2.3：npz 写出的并行度。`0` ⇒ 自动（min(16, CPU)）。1 ⇒ 退化为单线程。
+# ⭐ 0.2.3：npz 写出的并行度。`0` ⇒ 自动（min(16, CPU)）。1 ⇒ 退化为单线程。
 #    原理：把每个成员按 ~32 MB 切块，各块独立 deflate 并以 `Z_FULL_FLUSH` 收尾——
-#    串联后的字节串仍是合法 deflate 流，所以 zip 里依然是一个成员、格式不变。
+#    串联后的字节串仍是**合法 deflate 流**，所以 zip 里依然是一个成员、格式不变。
 NPZ_THREADS = 0
 
 
@@ -100,7 +102,7 @@ def _deflate_blocks(buf: bytes, level: int) -> bytes:
 def _zip_write(path, arrays, level: int) -> int:
     """手写 zip（存储/压缩均可），成员名 `<name>.npy`。返回落盘字节数。
 
-    不用 `zipfile`：它每条成员只会顺序压缩，压不进并行；但产出必须是合法 zip，
+    ⛔ 不用 `zipfile`：它每条成员只会顺序压缩，压不进并行；但**产出必须是合法 zip**，
        否则 `np.load` 读不了。写完由调用方/测试用 `np.load` 回读校验。
     """
     import struct
@@ -110,38 +112,47 @@ def _zip_write(path, arrays, level: int) -> int:
     t = time.localtime()
     dos_time = (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2)
     dos_date = ((t.tm_year - 1980) << 9) | (t.tm_mon << 5) | t.tm_mday
+    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     central = []
-    with open(path, "wb") as f:
-        for name, arr in arrays.items():
-            raw = _npy_member(arr)
-            crc = zlib.crc32(raw) & 0xFFFFFFFF
-            if level <= 0:
-                comp, method = raw, 0
-            else:
-                comp, method = _deflate_blocks(raw, level), 8
-            nb = (str(name) + ".npy").encode("utf-8")
-            off = f.tell()
-            f.write(struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, method, dos_time,
-                                dos_date, crc, len(comp), len(raw), len(nb), 0))
-            f.write(nb)
-            f.write(comp)
-            central.append((nb, crc, len(comp), len(raw), method, off))
-        cd_off = f.tell()
-        for nb, crc, csize, usize, method, off in central:
-            f.write(struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, method,
-                                dos_time, dos_date, crc, csize, usize, len(nb),
-                                0, 0, 0, 0, 0, off))
-            f.write(nb)
-        cd_size = f.tell() - cd_off
-        f.write(struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(central),
-                            len(central), cd_size, cd_off, 0))
+    try:
+        with open(tmp_path, "wb") as f:
+            for name, arr in arrays.items():
+                raw = _npy_member(arr)
+                crc = zlib.crc32(raw) & 0xFFFFFFFF
+                if level <= 0:
+                    comp, method = raw, 0
+                else:
+                    comp, method = _deflate_blocks(raw, level), 8
+                nb = (str(name) + ".npy").encode("utf-8")
+                off = f.tell()
+                f.write(struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, method, dos_time,
+                                    dos_date, crc, len(comp), len(raw), len(nb), 0))
+                f.write(nb)
+                f.write(comp)
+                central.append((nb, crc, len(comp), len(raw), method, off))
+            cd_off = f.tell()
+            for nb, crc, csize, usize, method, off in central:
+                f.write(struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, method,
+                                    dos_time, dos_date, crc, csize, usize, len(nb),
+                                    0, 0, 0, 0, 0, off))
+                f.write(nb)
+            cd_size = f.tell() - cd_off
+            f.write(struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(central),
+                                len(central), cd_size, cd_off, 0))
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return int(os.path.getsize(path))
 
 
 def _write_npz(path, arrays, level=None) -> dict:
     """写 npz（zip ＋ 逐个 `.npy` 成员），**压缩档位与并行度可控**。
 
-    成员名与 `np.savez_compressed` 完全一致（`<name>.npy`），所以读端一行都不用改，
+    ⛔ 成员名与 `np.savez_compressed` 完全一致（`<name>.npy`），所以读端一行都不用改，
        旧索引也照旧能读 —— 这是"只换压缩级别、不换格式"。
     """
     path = str(path)
@@ -154,8 +165,8 @@ def _write_npz(path, arrays, level=None) -> dict:
 
 
 __all__ = [
-    "SparseBM25", "zh_tokenize", "simple_tokenize", "tokenizer_status",
-    "log", "auto_workers", "ViewError",
+    "SparseBM25", "zh_tokenize", "code_tokenize", "get_tokenizer", "simple_tokenize",
+    "tokenizer_status", "log", "auto_workers", "ViewError",
 ]
 
 
@@ -256,6 +267,47 @@ def zh_tokenize(text):
     if _JIEBA:
         return [w.lower() for w in _JIEBA.cut(text) if w.strip()]
     return simple_tokenize(text)
+
+
+_CODE_ID_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]{1,}')
+_CODE_SUB_RE = re.compile(r'[A-Z]+\d*(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+\d*|\d+')
+
+
+def code_tokenize(text):
+    """代码感知分词（支线 #15）：保留原有 `zh_tokenize` 全词，同时补发完整蛇形标识符与驼峰子词。
+
+    例如 `SparseBM25` → 保留 `sparsebm25` 并补 `sparse`、`bm25`；`_load_cache` → 补齐完整 `_load_cache`。
+    纯中文或普通英文单词行为与 `zh_tokenize` 一致。
+    """
+    toks = zh_tokenize(text)
+    tok_set = set(toks)
+    extra = []
+    for ident in _CODE_ID_RE.findall(text):
+        low = ident.lower()
+        if '_' not in ident and (ident.islower() or ident.isupper()):
+            continue
+        if '_' in ident and low not in tok_set:
+            extra.append(low)
+            tok_set.add(low)
+        for seg in ident.split('_'):
+            if not seg or seg.islower() or seg.isupper():
+                continue
+            subs = [p.lower() for p in _CODE_SUB_RE.findall(seg)]
+            if len(subs) >= 2:
+                for s in subs:
+                    if len(s) >= 2:
+                        extra.append(s)
+    return toks + extra if extra else toks
+
+
+def get_tokenizer(mode="zh_default"):
+    """按持久化 `tokenizer_mode` 返回对应分词函数（向后兼容默认 `'zh_default'`）。"""
+    m = str(mode or "zh_default").strip().lower()
+    if m in ("zh_default", "default"):
+        return zh_tokenize
+    if m in ("zh_code", "code"):
+        return code_tokenize
+    raise ValueError(f"未知 tokenizer_mode={mode!r}；可选 'zh_default'/'zh_code'")
 
 
 def full_hash(text):
@@ -564,6 +616,21 @@ def _with_write(fn):
     return wrapper
 
 
+def _close_memmap(arr) -> None:
+    """释放 numpy memmap 持有的 OS 映射句柄（Windows 删除/重存不再报 EACCES/EINVAL）。"""
+    if arr is None:
+        return
+    mm = getattr(arr, "_mmap", None)
+    if mm is None:
+        base = getattr(arr, "base", None)
+        mm = getattr(base, "_mmap", None) if base is not None else None
+    if mm is not None:
+        try:
+            mm.close()
+        except Exception:
+            pass
+
+
 class SparseBM25:
     """两遍扫描构建 scipy CSR BM25 权重矩阵（8.84M 段内存友好）:
 
@@ -582,10 +649,10 @@ class SparseBM25:
     #    `FAST_SCORE` 是 `DN_PRECOMP`/`ADD_AT`/`W_CACHE` 的总闸：不开它那三个开关在默认路径上全部失效。
     #    逐位：只做"不改变浮点运算顺序"的改动；`WRITE_DICT` 的收益：写路径逐词查找 5.163µs → 0.214µs。
     WRITE_DICT = False
-    # 01l：批量向量化写路径（opt-in，默认关，不改默认行为）——
+    # 01l：**批量向量化写路径**（opt-in，默认关，不改默认行为）——
     #      `append_docs` 把"逐词 Python 循环"换成"一次映射 ＋ `np.unique` ＋ `bincount`"。
-    #      载体在岗（`term2idx` 是 `VocabMmap`）时它会建一次 dict 并缓存
-    #      （一次 O(V) ≈0.5 µs/词）：因为逐词走 mmap 二分是 4.35 µs/次，批量也救不了。
+    #      ⚠️ 载体在岗（`term2idx` 是 `VocabMmap`）时它会**建一次 dict 并缓存**
+    #      （一次 O(V) ≈0.5 µs/词）：因为逐词走 mmap 二分是 **4.35 µs/次**，批量也救不了。
     WRITE_VEC = False
     # 01f：预计算"每行规范化项" `dn[d] = k1(1-b+b·dl/avgdl)`（N 级，1M 段 ≈4 MB），
     #      查询期省掉每 posting 一次 `dl[rows]` gather ＋ 3 次逐元素运算。
@@ -628,6 +695,7 @@ class SparseBM25:
         # 建库时的分词档, 随索引落盘 (`off`/`on`/`ids`), 供整库重建复用 ——
         #    不落盘的话重载后由上层触发的重建会退回内存最高的默认档。
         self.stream_mode = "ids" if stream == "ids" else ("on" if stream else "off")
+        self.tokenizer_mode = "zh_code" if tok is code_tokenize else "zh_default"
         self._dead = None      # bool[N] 墓碑 (None=全活); append 时扩展
         # 视图 = BM25 权威层之上可丢可滞后可分版的派生层（覆盖位图 + 视图可用性）。
         # 删掉全部视图时查询逐位回 BM25-only；视图不持久化（save/load 都不写它），
@@ -711,7 +779,7 @@ class SparseBM25:
                     doc_toks = [tok(d) for d in docs]
             else:
                 doc_toks = [tok(d) for d in docs]
-            # pass1: 词表（复用 doc_toks）＋ 顺手取精确 nnz（`len(set(toks))` ＝ pass2 的 tf 条目数）
+            # pass1: 词表（复用 doc_toks）＋ 顺手取**精确 nnz**（`len(set(toks))` ＝ pass2 的 tf 条目数）
             nnz_hint = 0
             for i, toks in enumerate(doc_toks):
                 self.dl[i] = len(toks)
@@ -1035,7 +1103,7 @@ class SparseBM25:
             mt = 0
         return f"{p}|{mt}|{tuple(self.T.shape)}|{int(self.T.nnz)}"
 
-    def _ensure_tc(self):
+    def _ensure_tc(self, *, shared=None):
         """01e-C: 补建分块 CSC 缺口 —— 只建 [covered, T行数) 这一块, O(新 nnz)。
 
         块只存 tf 结构 (idf/dead 查询时应用), 统计变化不失效旧块; 唯一的
@@ -1053,12 +1121,13 @@ class SparseBM25:
         with self._cache_mu:
             if self._tc_rows >= t_rows:          # 双检：别的线程可能刚补完
                 return
-            self._ensure_tc_locked(t_rows)
+            self._ensure_tc_locked(t_rows, shared=shared)
 
-    def _ensure_tc_locked(self, t_rows: int):
+    def _ensure_tc_locked(self, t_rows: int, *, shared=None):
         """`_ensure_tc` 的变异部分（调用方已持有 `_cache_mu`）。"""
         if not self._tc_blocks:
-            if type(self).TC_SHARED:
+            use_shared = type(self).TC_SHARED if shared is None else bool(shared)
+            if use_shared:
                 from .tc_shared import publish_or_attach
                 csc, info = publish_or_attach(self.T, self._tc_key())
                 self._tc_shared_info = info
@@ -1098,9 +1167,9 @@ class SparseBM25:
         if k >= n:
             idx = np.arange(n)
         else:
-            # 01m（P-D）：原地取负，省掉一个 N 长临时（@8.84M ≈35 MB/查询）。
+            # ⭐ 01m（P-D）：**原地取负**，省掉一个 N 长临时（@8.84M ≈35 MB/查询）。
             #    `s` 是本函数刚建出来的局部量 ⇒ 就地改写对调用方不可见；
-            #    `-(-x)` 对含 ±0 的 float 也逐位恒等 ⇒ 返回的 `s[idx]` 与改前一致。
+            #    `-(-x)` 对含 ±0 的 float 也**逐位恒等** ⇒ 返回的 `s[idx]` 与改前一致。
             np.negative(s, out=s)
             idx = np.argpartition(s, k - 1)[:k]      # kth 靠近开头（比"末尾"快）
             np.negative(s, out=s)                    # 还原
@@ -1109,6 +1178,40 @@ class SparseBM25:
         return idx, s[idx]
 
     # ---------------- 段挂载：只读 postings ＋ 合并 df 查询（最小档） ----------------
+
+    def _extend_vocab(self, new_terms):
+        """增量扩词表（0.4 P1）：底层是 `VocabMmap`/`OverlayVocab` 时走分层代理，保持基座零拷贝。"""
+        terms = list(new_terms)
+        if not terms:
+            return
+        from .vocab_mmap import OverlayVocab, VocabMmap
+
+        if isinstance(self.idx2term, OverlayVocab):
+            ov = self.idx2term.extended(terms)
+            self.idx2term = ov
+            self.term2idx = ov
+        elif isinstance(self.idx2term, VocabMmap):
+            ov = OverlayVocab(self.idx2term, terms)
+            self.idx2term = ov
+            self.term2idx = ov
+        else:
+            self.idx2term = list(self.idx2term) + terms
+            self.term2idx = {t: k for k, t in enumerate(self.idx2term)}
+        self._write_dict = None
+
+    def _truncate_vocab(self, new_len: int):
+        """按长度截断词表（用于 `unmount_segment`）；回到 `VocabMmap` 基座长度时直接还原。"""
+        from .vocab_mmap import OverlayVocab
+
+        n = int(new_len)
+        if isinstance(self.idx2term, OverlayVocab):
+            restored = self.idx2term.truncated(n)
+            self.idx2term = restored
+            self.term2idx = restored if hasattr(restored, "id_of") else {t: k for k, t in enumerate(restored)}
+        else:
+            self.idx2term = list(self.idx2term)[:n]
+            self.term2idx = {t: k for k, t in enumerate(self.idx2term)}
+        self._write_dict = None
 
     @_with_write
     def mount_segment(self, seg_dir, tag, new_terms, dl, rows=None, *, generation=None):
@@ -1163,14 +1266,14 @@ class SparseBM25:
         contrib = np.diff(seg.indptr).astype(np.int32)
         self.df = np.concatenate([np.asarray(self.df, dtype=np.int32),
                                   np.zeros(M, dtype=np.int32)]) + contrib
-        # ③ 扩词表（载体只读, 用普通 dict 覆盖）＋ 扩 dl/N
-        self.idx2term = list(self.idx2term) + list(new_terms)
-        self.term2idx = {t: k for k, t in enumerate(self.idx2term)}
+        # ③ 扩词表（0.4 P1：`VocabMmap` 走 `OverlayVocab` 分层代理，不炸成全量 dict）＋ 扩 dl/N
+        self._extend_vocab(new_terms)
         self.dl = np.concatenate([np.asarray(self.dl, dtype=np.float32),
                                   np.asarray(dl, dtype=np.float32)])
         if self._dead is not None:
             self._dead = np.concatenate([self._dead, np.zeros(n_seg, dtype=bool)])
         self.N = row_base + n_seg
+        self._views_extend(n_seg)
         # ④ 重算统计（idf 是全局量, 老文档分数也会变）
         self._invalidate_w()
         self._recompute_stats()
@@ -1208,13 +1311,13 @@ class SparseBM25:
         self._tc_blocks, self._tc_rows = [], 0
         # ② 撤 df（减掉该段的贡献）＋ 缩词表
         self.df = (np.asarray(self.df, dtype=np.int32) - np.asarray(info["contrib"], dtype=np.int32))[:V0]
-        self.idx2term = list(self.idx2term)[:V0]
-        self.term2idx = {t: k for k, t in enumerate(self.idx2term)}
-        # ③ 缩 dl / dead / N
+        self._truncate_vocab(V0)
+        # ③ 缩 dl / dead / N ＋ 同步裁剪视图覆盖位图
         self.dl = np.asarray(self.dl, dtype=np.float32)[:rb]
         if self._dead is not None:
             self._dead = np.asarray(self._dead)[:rb]
         self.N = rb
+        self._views_shrink(rb)
         # ④ 统计重算 ＋ 删除留档
         self._invalidate_w()
         self._recompute_stats()
@@ -1250,8 +1353,8 @@ class SparseBM25:
         if int(T.shape[1]) < V1:                       # 扩列：只换形状，不拷数据
             T = csr_matrix((T.data, T.indices, T.indptr), shape=(int(T.shape[0]), V1))
         self.T = _sp_vstack([T, csc.tocsr()], format="csr").astype(np.float32)   # 追加行：O(nnz) 一次性
-        # 必须丢掉旧的预分配后端：`_Tbuf` 里还是折叠前那份行表，下一次 `append_docs()`
-        #    会 `self.T = self._Tbuf.wrap()` 把主表还原成折叠前（段的行静默消失，
+        # ⚠️ 必须丢掉旧的预分配后端：`_Tbuf` 里还是折叠前那份行表，下一次 `append_docs()`
+        #    会 `self.T = self._Tbuf.wrap()` 把主表**还原**成折叠前（段的行静默消失，
         #    而 `dl`/`dead`/`N` 仍是折叠后的长度 ⇒ 重载时 `len(dl) != T 行数` 直接崩）。
         #    让下一次追加按新 `T` 重新预分配。
         self._Tbuf = None
@@ -1485,14 +1588,14 @@ class SparseBM25:
     def _append_docs_vec(self, toks_list, k, base):
         r"""`WRITE_VEC=True` 的批量向量化写路径（与 `append_docs` **逐位等价**）。
 
-        等价性论证（三条都必须成立，否则逐位必挂）：
-        ① 一行一词一条：legacy 用 `defaultdict` 计数 ⇒ 唯一；这里对 `doc*V + col`
-           复合键做 `np.unique` ⇒ 同样唯一，且列号升序；
-        ② 行内顺序无关：`PreallocCSR.append` 之后必过 `_sort_new_rows`（按列 `kind="stable"`）
-           ⇒ legacy 的"首次出现序"与这里的"列升序"排完同形（升序是稳定排序的不动点）；
-        ③ 统计量：`df[ci] += 1` 每 `(doc, 词)` 一次 ⇔ `bincount(cols)`；`dl` 用 `len(toks)`
-           （含表外词，与 legacy 的 `len(t)` 一字不差）。
-        词表封闭：表外词映射为 `-1` 后整条丢掉（与 legacy 的 `continue` 同义）。
+        ⭐ 等价性论证（三条都必须成立，否则逐位必挂）：
+        ① **一行一词一条**：legacy 用 `defaultdict` 计数 ⇒ 唯一；这里对 `doc*V + col`
+           复合键做 `np.unique` ⇒ 同样唯一，且**列号升序**；
+        ② **行内顺序无关**：`PreallocCSR.append` 之后必过 `_sort_new_rows`（按列 `kind="stable"`）
+           ⇒ legacy 的"首次出现序"与这里的"列升序"**排完同形**（升序是稳定排序的不动点）；
+        ③ **统计量**：`df[ci] += 1` 每 `(doc, 词)` 一次 ⇔ `bincount(cols)`；`dl` 用 `len(toks)`
+           （**含表外词**，与 legacy 的 `len(t)` 一字不差）。
+        ⚠️ **词表封闭**：表外词映射为 `-1` 后整条丢掉（与 legacy 的 `continue` 同义）。
         """
         # ① 查找表：载体在岗（`VocabMmap`）⇒ 建一次 dict 并缓存（一次 O(V)，批量必然赚）
         t2i = getattr(self, "_write_dict", None)
@@ -1519,7 +1622,7 @@ class SparseBM25:
         counts = np.bincount(d_u, minlength=k).astype(np.int64)   # 空行/全表外 ⇒ 0
         tfs = cnt.astype(np.float32)                              # tf 为整数 ⇒ 精确
         del doc, ids, uniq
-        # ⑤ 追加（`PreallocCSR.append` 的第 1 个参数只取长度 ⇒ 传 cols 即可，不另分配）
+        # ⑤ 追加（`PreallocCSR.append` 的第 1 个参数**只取长度** ⇒ 传 cols 即可，不另分配）
         if self._Tbuf is None:
             self._Tbuf = PreallocCSR.from_csr(self.T.tocsr(), slack=self.T_SLACK)
         self._Tbuf.append(c_u, c_u, tfs, counts)
@@ -1646,7 +1749,7 @@ class SparseBM25:
         v["available"] = bool(available)
 
     def _views_extend(self, k):
-        """append_docs 扩 N 后：每个视图的覆盖位图补 k 个 False（新行 = 未覆盖）。
+        """append_docs / mount_segment 扩 N 后：每个视图的覆盖位图补 k 个 False（新行 = 未覆盖）。
 
         旧物化对象（load 前的旧脚本）可能没有 `_views`, 惰性补空, 不报错。
         """
@@ -1656,6 +1759,20 @@ class SparseBM25:
         for v in views.values():
             v["coverage"] = np.concatenate(
                 [v["coverage"], np.zeros(k, dtype=bool)])
+
+    def _views_shrink(self, new_n):
+        """unmount_segment 缩回 N 后：截断覆盖位图并剔除落在被撤段内的向量行，防止后续 append 错位。"""
+        views = getattr(self, "_views", None)
+        if not views:
+            return
+        for v in views.values():
+            v["coverage"] = np.asarray(v["coverage"], dtype=bool)[:new_n]
+            rows = v["rows"]
+            if rows.size and int(rows[-1]) >= new_n:
+                keep = rows < new_n
+                v["rows"] = rows[keep]
+                v["vectors"] = v["vectors"][keep]
+                v["vn"] = v["vn"][keep]
 
     def view_report(self, names=None):
         """接口 C 消费侧：视图清单（覆盖位图统计 + 可用性 + meta）。
@@ -1716,44 +1833,154 @@ class SparseBM25:
         fused[sel] = base[sel] + delta
         return fused
 
-    @_with_read
-    def _write_mm_sidecar(self, path):
-        """把 `T_data/T_idx/T_ptr/dl/idf/dead` 写成裸 `.npy`（供 `load` 用 mmap）。
+    @staticmethod
+    def _swap_sidecar_dir(tmp_dir, target_dir, release_cb=None):
+        """原子目录双缓冲切换（0.4 P1）：先释放本实例旧 mmap 句柄，再 rename 替换。"""
+        import shutil as _sh
 
-        这是多写一份（1M 上 165.6 MB ≈ 2 s）。`MM_SIDECAR=False` 时整块跳过：
-        冷启退化成从 npz 解压（分数不变），`.mm/` 的世代键会保证陈旧件不被采用。
+        old_dir = None
+        if target_dir.exists():
+            if release_cb is not None:
+                release_cb()
+            old_dir = target_dir.with_name(f"{target_dir.name}.old.{os.getpid()}.{threading.get_ident()}")
+            if old_dir.exists():
+                _sh.rmtree(old_dir, ignore_errors=True)
+            target_dir.rename(old_dir)
+        tmp_dir.rename(target_dir)
+        if old_dir is not None and old_dir.exists():
+            _sh.rmtree(old_dir, ignore_errors=True)
+
+    @_with_read
+    def _write_mm_sidecar(self, path, w_cache=False):
+        """把 `T_data/T_idx/T_ptr/dl/idf/dead`（及可选 `w_*`）写入 `.mm.tmp` 后双缓冲切换。
+
+        0.4 P1：解决 Windows 就地重存因活动 mmap 导致的 `OSError(22)`，切换后为本实例重挂只读 mmap。
         """
+        import shutil as _sh
+        from pathlib import Path as _P2
+
+        _d2 = _P2(str(path) + ".mm")
+        _tmp = _d2.with_name(f"{_d2.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+        released_self = False
+        t_shape = tuple(self.T.shape) if self.T is not None else None
         try:
-            from pathlib import Path as _P2
-            _d2 = _P2(str(path) + ".mm")
-            _d2.mkdir(parents=True, exist_ok=True)
+            if _tmp.exists():
+                _sh.rmtree(_tmp, ignore_errors=True)
+            _tmp.mkdir(parents=True, exist_ok=True)
             if self.T is not None:
-                np.save(_d2 / "T_data.npy", self.T.data)
-                np.save(_d2 / "T_idx.npy", self.T.indices)
-                np.save(_d2 / "T_ptr.npy", self.T.indptr)
-                np.save(_d2 / "T_shape.npy", np.asarray(self.T.shape, dtype=np.int64))
+                np.save(_tmp / "T_data.npy", self.T.data)
+                np.save(_tmp / "T_idx.npy", self.T.indices)
+                np.save(_tmp / "T_ptr.npy", self.T.indptr)
+                np.save(_tmp / "T_shape.npy", np.asarray(self.T.shape, dtype=np.int64))
             for _nm, _fn in (("_idf", "idf.npy"), ("dl", "dl.npy")):
                 _a = getattr(self, _nm, None)
                 if _a is not None:
-                    np.save(_d2 / _fn, _a)
+                    np.save(_tmp / _fn, _a)
             if self._dead is not None:
-                np.save(_d2 / "dead.npy", self._dead)
-            # 世代键：`.mm/` 与 npz 必须同代, 否则 `load` 会跨源取字段（`T/dl/idf/dead` ← `.mm/`,
-            #    `df/params/N` ← npz）而同形状静默给错分数。键 = npz 的 `名字|mtime_ns|size`,
-            #    放在 npz 之后写；键不符则 `load` 拒用 `.mm/`（npz 自带 `T_data`, 只退化成"不 mmap"）。
+                np.save(_tmp / "dead.npy", self._dead)
             _npz = _P2(str(path)) if _P2(str(path)).exists() else _P2(str(path) + ".npz")
             if _npz.exists():
                 _st = _npz.stat()
-                (_d2 / "mm_key.txt").write_text(
+                (_tmp / "mm_key.txt").write_text(
                     f"v1|{_npz.name}|{_st.st_mtime_ns}|{_st.st_size}"
                     f"|N={int(self.N)}|nnz={int(self.T.nnz) if self.T is not None else 0}",
                     encoding="utf-8")
+            _wb_count = 0
+            _wb_bytes = 0
+            if w_cache and self.T is not None:
+                try:
+                    _wb = self._ensure_w()
+                    for _i, _arr in enumerate(_wb):
+                        _a_arr = np.asarray(_arr)
+                        np.save(_tmp / f"w_{_i}.npy", _a_arr)
+                        _wb_bytes += int(_a_arr.nbytes)
+                    (_tmp / "w_key.txt").write_text(self._w_persist_key(), encoding="utf-8")
+                    _wb_count = len(_wb)
+                except Exception as _we:
+                    warn(f"[WARN] 物化层 w 落盘失败（附加件；功能不受影响，只是冷启动要重建）: "
+                         f"{type(_we).__name__}: {_we!r}")
+
+            idx_p = getattr(self, "_index_path", None)
+            same_idx = False
+            if idx_p:
+                p_cur = _P2(str(idx_p) if str(idx_p).endswith(".npz") else str(idx_p) + ".npz").resolve()
+                same_idx = (p_cur == _npz.resolve())
+            holding_mm = same_idx and bool(
+                getattr(self, "_mm_postings", None)
+                or getattr(self, "_mm_mmaps", None)
+                or getattr(self, "_w_blocks", None)
+            )
+
+            def _release_mm():
+                nonlocal released_self
+                if not holding_mm:
+                    return
+                with self._cache_mu:
+                    wb = getattr(self, "_w_blocks", None)
+                    if wb:
+                        for arr in wb:
+                            _close_memmap(arr)
+                        self._w_blocks = None
+                    self._w_key_val = None
+                    for arr in getattr(self, "_mm_mmaps", ()) or ():
+                        _close_memmap(arr)
+                    if hasattr(self, "_mm_mmaps"):
+                        self._mm_mmaps = []
+                    for arr in getattr(self, "_mm_postings", ()) or ():
+                        _close_memmap(arr)
+                    self._mm_postings = None
+                    _close_memmap(getattr(self, "_idf", None))
+                    _close_memmap(getattr(self, "dl", None))
+                    released_self = True
+
+            self._swap_sidecar_dir(_tmp, _d2, release_cb=_release_mm if holding_mm else None)
+
+            if released_self:
+                with self._cache_mu:
+                    _td = np.load(_d2 / "T_data.npy", mmap_mode="r")
+                    _ti = np.load(_d2 / "T_idx.npy", mmap_mode="r")
+                    _tp = np.load(_d2 / "T_ptr.npy", mmap_mode="r")
+                    self.T = csr_matrix((_td, _ti, _tp), shape=t_shape, copy=False)
+                    self._mm_postings = (_td, _ti, _tp)
+                    self._idf = np.load(_d2 / "idf.npy", mmap_mode="r")
+                    self.dl = np.load(_d2 / "dl.npy", mmap_mode="r")
+                    self._mm_mmaps = [_td, _ti, _tp, self._idf, self.dl]
+                    self._Tbuf = None
+                    self._tc_blocks = []
+                    self._tc_rows = 0
+            if _wb_count:
+                self._w_persist_dir = str(_d2)
+                self._w_persist_ok = True
+                log(f"S1 物化层 w 落盘: {_d2}（{_wb_count} 块 → {_wb_bytes:,} B；键已写入 w_key.txt）")
+            else:
+                self._w_persist_dir = None
+                self._w_persist_ok = False
+
             _b = 0 if self.T is None else (int(self.T.data.nbytes) + int(self.T.indices.nbytes)
                                            + int(self.T.indptr.nbytes))
             log(f"S1 postings 上总线: {_d2}（T {_b:,} B，世代键已写 mm_key.txt）")
         except Exception as _e:
-            warn(f"[WARN] postings 落盘跳过（附加件失败）: {type(_e).__name__}: {_e!r}"
-                 f"  注意：Windows 上「就地重存」会撞 mmap 锁（既有 .mm/ 已被 mmap）→ 建议存到新目录")
+            if released_self and _tmp.exists():
+                # 外部进程持有旧 .mm 锁导致 swap 失败：从 _tmp 恢复 RAM 数组保证当前实例不断链
+                try:
+                    with self._cache_mu:
+                        if t_shape is not None and (_tmp / "T_data.npy").exists():
+                            self.T = csr_matrix(
+                                (np.load(_tmp / "T_data.npy"), np.load(_tmp / "T_idx.npy"),
+                                 np.load(_tmp / "T_ptr.npy")),
+                                shape=t_shape,
+                            )
+                        if (_tmp / "idf.npy").exists():
+                            self._idf = np.load(_tmp / "idf.npy")
+                        if (_tmp / "dl.npy").exists():
+                            self.dl = np.load(_tmp / "dl.npy")
+                        self._Tbuf = None
+                        self._tc_blocks = []
+                        self._tc_rows = 0
+                except Exception:
+                    pass
+            _sh.rmtree(_tmp, ignore_errors=True)
+            warn(f"[WARN] postings 落盘跳过（附加件失败）: {type(_e).__name__}: {_e!r}")
 
     def save(self, path, w_cache=False, mm=None):
         """落盘索引。`w_cache=True` 时额外把物化层 `w` 写进 `.mm/`（opt-in，默认不写）。
@@ -1772,10 +1999,11 @@ class SparseBM25:
                 f"已挂段 {sorted(_segs)}：`save()` 会写出 `dl`(len={int(self.N)}) 与 "
                 f"`T`(rows={int(self.T.shape[0]) if self.T is not None else 0}) 不一致的 npz "
                 f"（重载会崩）→ 请先 `fold_all()` 把它们并进主表，或先 `unmount_segment(tag)`）")
-        z = dict(vocab=np.asarray(self.idx2term, dtype=object),
+        z = dict(vocab=np.asarray(list(self.idx2term), dtype=object),
                  dl=self.dl,  # dl 必须落盘, 否则 load 后 BM25 分数失真
                  params=np.asarray([self.k1, self.b, self.avgdl], dtype=np.float32),
-                 stream_mode=np.asarray([self.stream_mode]))
+                 stream_mode=np.asarray([self.stream_mode]),
+                 tokenizer_mode=np.asarray([getattr(self, "tokenizer_mode", "zh_default")]))
         if self.T is not None:
             z.update(fmt='primolix-bm25-v3',
                      W_shape=np.asarray(self.T.shape, dtype=np.int64),
@@ -1791,32 +2019,62 @@ class SparseBM25:
                      W_ptr=self.W.indptr, W_shape=np.asarray(self.W.shape, dtype=np.int64))
         _write_npz(path, z)
         #    附加落盘（不动上方 npz, 向后兼容不变）。词表常驻 ~9MB(私有) → ~0.14MB(文件后备)。
-        #     附加件：失败不许拖垮落盘。
+        #     附加件：失败不许拖垮落盘；0.4 P1：先写 `.vocab.tmp` 再释句柄双缓冲切换。
         try:
-            from .vocab_mmap import write as _vm_write
-            _acct = _vm_write(self.idx2term, str(path) + ".vocab")
-            # 载体的世代键：载体被 `load` 优先采用, 若没有键, 侧车就地重存失败残留的旧载体
-            #    会让重载的新词静默消失。键口径与 `.mm/mm_key.txt` 一致：
-            #    `v1|名字|mtime_ns|size`（尾部带 `V` 便于人读）。
+            import shutil as _shv
             from pathlib import Path as _Pv
+            from .vocab_mmap import VocabMmap as _VMap, write as _vm_write
+
+            _vdir = _Pv(str(path) + ".vocab")
+            _vtmp = _vdir.with_name(f"{_vdir.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+            if _vtmp.exists():
+                _shv.rmtree(_vtmp, ignore_errors=True)
+            vocab_snapshot = list(self.idx2term)
+            _acct = _vm_write(vocab_snapshot, str(_vtmp))
             _npzv = _Pv(str(path))
             if not _npzv.exists():
                 _npzv = _Pv(str(path) + ".npz")
             if _npzv.exists():
                 _stv = _npzv.stat()
-                (_Pv(str(path) + ".vocab") / "vocab_key.txt").write_text(
-                    f"v1|{_npzv.name}|{_stv.st_mtime_ns}|{_stv.st_size}|V={len(self.idx2term)}",
+                (_vtmp / "vocab_key.txt").write_text(
+                    f"v1|{_npzv.name}|{_stv.st_mtime_ns}|{_stv.st_size}|V={len(vocab_snapshot)}",
                     encoding="utf-8")
+
+            _vc = getattr(self, "_vocab_carrier", None)
+            _holding_v = (_vc is not None and _Pv(_vc.dir).resolve() == _vdir.resolve())
+            _released_v = False
+
+            def _release_vocab():
+                nonlocal _released_v
+                if _holding_v and self._vocab_carrier is not None:
+                    self._vocab_carrier.close()
+                    self._vocab_carrier = None
+                    _released_v = True
+
+            try:
+                self._swap_sidecar_dir(_vtmp, _vdir, release_cb=_release_vocab if _holding_v else None)
+                if _released_v:
+                    _new_vc = _VMap(_vdir)
+                    self._vocab_carrier = _new_vc
+                    self.idx2term = _new_vc
+                    self.term2idx = _new_vc
+                    self._write_dict = None
+            except Exception:
+                _shv.rmtree(_vtmp, ignore_errors=True)
+                if _released_v:
+                    self.idx2term = vocab_snapshot
+                    self.term2idx = {t: k for k, t in enumerate(vocab_snapshot)}
+                    self._write_dict = None
+                raise
             log(f"S1 词表载体落盘: {str(path)}.vocab（{_acct['total']:,} B / "
-                f"{_acct['total'] / max(len(self.idx2term), 1):.1f} B/词；世代键已写）")
+                f"{_acct['total'] / max(len(vocab_snapshot), 1):.1f} B/词；世代键已写）")
         except Exception as _e:
             warn(f"[WARN] 词表载体落盘跳过（附加件失败，功能不受影响但会退化）: {_e!r}")
         #    落成独立 `.npy`, `load` 可 `mmap_mode='r'`（文件后备、可共享、可丢）。
         #     `df` 故意不落：`_tombstone_rows` 会原地写 `df`（只读 mmap 会当场报错）。
         if MM_SIDECAR if mm is None else bool(mm):
-            self._write_mm_sidecar(path)
-        # 01h：物化层 `w` 单独一个 try —— 不许被上面 `T_*` 的覆盖失败连坐
-        if w_cache and self.T is not None:
+            self._write_mm_sidecar(path, w_cache=bool(w_cache))
+        elif w_cache and self.T is not None:
             try:
                 from pathlib import Path as _P3
                 _d3 = _P3(str(path) + ".mm")
@@ -1842,88 +2100,33 @@ class SparseBM25:
         ``N``/``V`` 参数仅为兼容旧调用而保留, 实际以文件形状为准
         (增量后物理行 > 原语料, 禁用调用方猜测的 N)。
         """
-        z = np.load(path, allow_pickle=True)
-        fmt = str(z.get('fmt', b'primolix-bm25-v1')) if 'fmt' in z else 'primolix-bm25-v1'
-        # 兼容改名前的索引：复名前落盘写的是 `zelix-bm25-v2/v3`, 归一化后走同一套逻辑。
-        #    （改名只换了包名与类名, 盘上格式一字未变, 旧索引必须继续可加载）
-        fmt = fmt.replace('zelix-bm25-', 'primolix-bm25-')
-        has_w = 'W_data' in z
-        has_t = (fmt in ('primolix-bm25-v2', 'primolix-bm25-v3')
-                 and 'T_data' in z and z['T_data'].size)
-        if not has_w and not has_t:
-            raise RuntimeError(f"{path}: 既无 W_data 也无 T_data, 无法加载"
-                               f"（fmt={fmt!r}；若为旧版格式请确认 fmt 是否被改名影响）")
-        #    且多进程可共享。 载体缺席则回落老路径（list+dict），行为不变。
         from pathlib import Path as _Path
-        _carrier = _Path(str(path) + ".vocab")
-        _npz_vocab = z['vocab'].tolist() if 'vocab' in z else []
-        vocab = _npz_vocab                              # 默认就用 npz 自带的词表（永远在场）
-        if _carrier.exists():
-            # 世代键校验：载体被优先采用, 故键不符 / 缺键 / 长度与 npz 的 `vocab` 不一致
-            #    时一律拒用载体, 回落 npz 词表（否则会沿用残留旧载体, 新词静默消失）。
-            _npzp = _Path(str(path)) if _Path(str(path)).exists() else _Path(str(path) + ".npz")
-            _want = ""
-            if _npzp.exists():
-                _stp = _npzp.stat()
-                _want = f"v1|{_npzp.name}|{_stp.st_mtime_ns}|{_stp.st_size}"
-            _keyf = _carrier / "vocab_key.txt"
-            _got = _keyf.read_text(encoding="utf-8").strip() if _keyf.exists() else ""
-            _use = bool(_want) and _got.startswith(_want)
-            if _use:
-                from .vocab_mmap import VocabMmap
-                _cand = VocabMmap(_carrier)
-                if len(_cand) == len(_npz_vocab):
-                    vocab = _cand
-                else:
-                    _use = False
-                    _cand.close()
-            if not _use:
-                log(f"[WARN] 词表载体与 npz 不同代/长度不符 → 拒用，回落 npz 自带词表"
-                    f"（盘上={_got[:36] or '(缺键)'} · 期望={_want[:36]}）")
-        bm = cls.__new__(cls)
-        bm._rw = RWLock()                    # `load` 走 `__new__`, 并发原语要在这里补建
-        bm._cache_mu = threading.RLock()
-        bm.W = bm.Wc = None
-        if has_w:
-            bm.W = csr_matrix((z['W_data'], z['W_idx'], z['W_ptr']),
-                              shape=(int(z['W_shape'][0]), int(z['W_shape'][1])))
-            bm.Wc = bm.W.tocsc()   # 旧格式: 重建 CSC 缓存 (一次 O(nnz), 与旧 load 相同)
-            n_rows = int(z['W_shape'][0])  # 文件行数权威
-        else:
-            n_rows = int(z['T_shape'][0])  # v3: T 形状即行数权威
-        bm.N = n_rows
-        bm.idx2term = vocab
-        bm.term2idx = vocab if hasattr(vocab, "id_of") else {t: i for i, t in enumerate(vocab)}
-        bm._vocab_carrier = vocab if hasattr(vocab, "id_of") else None   #  两阶段 attach_hot 用
-        bm._index_path = str(path)          #  共享 CSC 的 key 用（`_tc_key`）
-        bm._tc_shared_info = None
-        bm.T = bm.df = bm._idf = None
-        bm._dead = None
-        bm._views = {}             # 接口 C: 视图不持久化（派生层，可由 sidecar 重挂）
-        bm._Tbuf = None            # 01e: 首次 append 时一次性换预分配后端
-        bm._tc_blocks = []         # 01e-C: 分块 CSC (有 T 时在下面建块0)
-        bm._tc_rows = 0
-        # 建库分词档: 缺字段 = 旧版索引, 按内存最高的默认档 `off` 处理。
-        bm.stream_mode = str(z['stream_mode'][0]) if 'stream_mode' in z else "off"
-        if 'dl' in z and len(z['dl']) == n_rows:
-            bm.dl = z['dl'].astype(np.float32)
-            bm.avgdl = float(z['params'][2]) if 'params' in z else float(bm.dl.sum()) / max(n_rows, 1)
-            bm.k1, bm.b = (float(z['params'][0]), float(z['params'][1])
-                           if 'params' in z else (1.5, 0.75))
-        else:
-            # 旧版索引无 dl: 从 CSR 按行还原 (O(nnz), 比伪 dl=0/avgdl=1.0 诚实)
-            log("[WARN] 索引缺 dl, 从 nnz 按行还原 (旧版格式)")
-            bm.dl = np.diff(bm.W.indptr).astype(np.float32)
-            bm.avgdl = float(bm.dl.sum()) / max(n_rows, 1)
-            bm.k1, bm.b = 1.5, 0.75
-        if has_t:
-            # v2/v3: 恢复 tf/df 原语 → 增量可用; 分块 CSC 块0 = 旧 `Tc = T.tocsc()` 等价物
-            if 'T_shape' in z:
-                Tshape = (int(z['T_shape'][0]), int(z['T_shape'][1]))
-            else:
-                Tshape = (int(z['W_shape'][0]), int(z['W_shape'][1]))
+
+        _npzp = _Path(str(path)) if _Path(str(path)).exists() else _Path(str(path) + ".npz")
+        if not _npzp.exists():
+            raise FileNotFoundError(
+                f"索引不完整：缺少主索引文件 {_npzp}（可用 `primolix index` 重建或补回该文件）"
+            )
+        with np.load(str(_npzp), allow_pickle=True) as z:
+            files_set = set(z.files)
+            fmt = str(z['fmt']) if 'fmt' in files_set else 'primolix-bm25-v1'
+            # 兼容改名前的索引：复名前落盘写的是 `zelix-bm25-v2/v3`, 归一化后走同一套逻辑。
+            #    （改名只换了包名与类名, 盘上格式一字未变, 旧索引必须继续可加载）
+            fmt = fmt.replace('zelix-bm25-', 'primolix-bm25-')
+            has_w = 'W_data' in files_set
+
+            _stp = _npzp.stat()
+            _cur_gen = f"v1|{_npzp.name}|{_stp.st_mtime_ns}|{_stp.st_size}"
+
+            # 0.4 P0: 先校验 `.mm/` 侧车，再决定是否触碰 `z['T_data']` / `z['dl']`（避开 158MB+ 无谓解压）
             _mmd = _Path(str(path) + ".mm")
-            _mm_ok = _mmd.exists() and (_mmd / "T_data.npy").exists()
+            _req_mm = ("T_data.npy", "T_idx.npy", "T_ptr.npy", "idf.npy", "dl.npy")
+            _mm_ok = _mmd.exists()
+            if _mm_ok:
+                _miss_mm = [fn for fn in _req_mm if not (_mmd / fn).exists()]
+                if _miss_mm:
+                    _mm_ok = False
+                    log(f"[WARN] `.mm/` 侧车缺件（缺: {', '.join(_miss_mm)}）→ 拒用，改从 npz 读 postings")
             # 世代校验：`.mm/` 与 npz 不同代时必须拒用 —— `load` 跨源取字段
             #    （`T/dl/idf/dead` ← `.mm/`, `df/params/N` ← npz）, 同形状下不报错却给陈旧分数。
             if _mm_ok:
@@ -1934,72 +2137,278 @@ class SparseBM25:
                         "改从 npz 读 postings（判据同 `w` 层：不一致一律拒用）")
                 else:
                     try:
-                        _st = _Path(str(path)).stat() if _Path(str(path)).exists() else None
-                        _cur = (f"v1|{_Path(str(path)).name}|{_st.st_mtime_ns}|{_st.st_size}"
-                                if _st is not None else "")
                         _got = _mk.read_text(encoding="utf-8").strip()
-                        if not _cur or not _got.startswith(_cur):
+                        if not _cur_gen or not _got.startswith(_cur_gen):
                             _mm_ok = False
                             log(f"[WARN] `.mm/` 与 npz 不同代 → 拒用（不回退静默！）·"
-                                f" 盘上={_got[:60]} · 当前={_cur[:60]}")
+                                f" 盘上={_got[:60]} · 当前={_cur_gen[:60]}")
                     except Exception as _e:                      # noqa: BLE001
                         _mm_ok = False
                         log(f"[WARN] `.mm/` 世代键不可读（{_e!r}）→ 拒用")
-            if _mm_ok:
-                _td = np.load(_mmd / "T_data.npy", mmap_mode="r")
-                _ti = np.load(_mmd / "T_idx.npy", mmap_mode="r")
-                _tp = np.load(_mmd / "T_ptr.npy", mmap_mode="r")
-                bm.T = csr_matrix((_td, _ti, _tp), shape=Tshape, copy=False)
-                bm._mm_postings = (_td, _ti, _tp)
-                _pi, _pl, _pd = _mmd / "idf.npy", _mmd / "dl.npy", _mmd / "dead.npy"
-                if _pi.exists():
-                    bm._idf = np.load(_pi, mmap_mode="r")
-                if _pl.exists():
-                    bm.dl = np.load(_pl, mmap_mode="r")
-                if _pd.exists():
-                    # 必须拷成可写：`_tombstone_rows` 要就地写 `_dead[r] = True`, 而 mmap 只读,
-                    #    否则"落盘→重载→再更新"会报 `ValueError: assignment destination is read-only`。
-                    #    （`dl`/`_idf` 只被重新绑定, 可留在 mmap 上）
-                    bm._dead = np.array(np.load(_pd, mmap_mode="r"), dtype=bool, copy=True)
-                #  `df` 仍来自 npz：`_tombstone_rows` 会原地写它（只读 mmap 会当场报错）
-                bm.df = z['df'].astype(np.int32) if 'df' in z else None
-                #    eager `tocsc()` —— 那是一次 O(nnz) 拷贝（@1M ≈330 MB + ~0.5 s），
-                #    会把 mmap 的懒页当场全部打穿，冷启仍是 O(nnz)。
-                #    CSC 改由首查的 `_ensure_tc()` 补建（空块 → 全量 tocsc，见
-                #    `_ensure_tc_locked`；@1M ≈0.5 s，一次性）。
-                #    `EAGER_TC` 开关继续管 npz 直读路径（那条本来就已付 nnz 读取）。
-                log("S1 postings 走 mmap · CSC 推到首查（.mm 在场 ⇒ 加载期不碰 postings 页）"
-                    + ("（TC_SHARED → 首查时发布/attach 共享段）" if cls.TC_SHARED else ""))
-            else:
-                bm.T = csr_matrix((z['T_data'], z['T_idx'], z['T_ptr']), shape=Tshape)
-                bm._tc_blocks = [(bm.T.tocsc(), 0)]
-                bm._tc_rows = int(Tshape[0])
-                bm.df = z['df'].astype(np.int32) if 'df' in z else None
-                bm._idf = z['_idf'].astype(np.float32) if '_idf' in z else None
-                d = z['dead'] if 'dead' in z and z['dead'].size else None
-                bm._dead = d.astype(bool) if d is not None else None
-        nnz = (bm.T.nnz if bm.T is not None
-               else (bm.W.nnz if bm.W is not None else 0))
-        # 01h：盘上有没有可用的物化层 `w`？—— 内容型键比对（不一致一律拒用）
-        bm._w_persist_dir = None
-        bm._w_persist_ok = False
-        bm._w_from_disk = False
-        try:
-            _wd = _Path(str(path) + ".mm")
-            _wk = _wd / "w_key.txt"
-            if bm.T is not None and _wk.exists() and list(_wd.glob("w_*.npy")):
-                _want = bm._w_persist_key()
-                _got = _wk.read_text(encoding="utf-8").strip()
-                if _got == _want:
-                    bm._w_persist_dir = str(_wd)
-                    bm._w_persist_ok = True
-                    log(f"S1 物化层 w 可用（键相符 → 首查直接 mmap，不必重建）")
+
+            t_shape_arr = z['T_shape'] if 'T_shape' in files_set else None
+            w_shape_arr = z['W_shape'] if (has_w and 'W_shape' in files_set) else None
+
+            _td_mm = None
+            has_t = False
+            if fmt in ('primolix-bm25-v2', 'primolix-bm25-v3') and 'T_data' in files_set:
+                if _mm_ok and t_shape_arr is not None:
+                    try:
+                        _td_mm = np.load(_mmd / "T_data.npy", mmap_mode="r")
+                        if _td_mm.size > 0:
+                            has_t = True
+                        else:
+                            _close_memmap(_td_mm)
+                            _td_mm = None
+                            has_t = bool(z['T_data'].size)
+                    except Exception:
+                        _close_memmap(_td_mm)
+                        _td_mm = None
+                        _mm_ok = False
+                        has_t = bool(z['T_data'].size)
                 else:
-                    log(f"[WARN] 盘上 w 的键不符 → 拒用（不回退静默！）·"
-                        f" 盘上={_got} · 当前={_want}")
-        except Exception as _e:                                    # noqa: BLE001
-            log(f"[WARN] 物化层 w 探测跳过: {_e!r}")
-        log(f"S1 从 {path} 加载索引 (fmt={fmt}, nnz={nnz}, 词表 {len(vocab)}, "
-            f"avgdl={bm.avgdl:.1f}, k1={bm.k1}, b={bm.b}"
-            + (", tf原语就绪" if bm.T is not None else ", tf原语缺失(v1, 增量不可用)"))
-        return bm
+                    has_t = bool(z['T_data'].size)
+
+            if not has_w and not has_t:
+                _close_memmap(_td_mm)
+                raise RuntimeError(f"{path}: 既无 W_data 也无 T_data, 无法加载"
+                                   f"（fmt={fmt!r}；若为旧版格式请确认 fmt 是否被改名影响）")
+
+            if has_w and w_shape_arr is not None:
+                n_rows = int(w_shape_arr[0])
+                expected_v = int(w_shape_arr[1])
+            else:
+                n_rows = int(t_shape_arr[0])
+                expected_v = int(t_shape_arr[1]) if t_shape_arr is not None else None
+
+            # 0.4 P0: 若 `.vocab/` 完备，用 `T_shape[1]`/`W_shape[1]` 校验词表长度，跳过 `z['vocab'].tolist()` 解压
+            _carrier = _Path(str(path) + ".vocab")
+            _npz_vocab = None
+            vocab = None
+            if _carrier.exists():
+                # 世代键校验：载体被优先采用, 故键不符 / 缺键 / 缺件 / 长度与 npz 不一致
+                #    时一律拒用载体, 回落 npz 词表（否则会沿用残留旧载体, 新词静默消失）。
+                _keyf = _carrier / "vocab_key.txt"
+                _got = _keyf.read_text(encoding="utf-8").strip() if _keyf.exists() else ""
+                _req_v = ("vocab.blob", "vocab_offs.u32", "vocab_sorted.u32")
+                _miss_v = [fn for fn in _req_v if not (_carrier / fn).exists()]
+                _use = bool(_cur_gen) and _got.startswith(_cur_gen) and not _miss_v
+                if _miss_v:
+                    log(f"[WARN] `.vocab/` 侧车缺件（缺: {', '.join(_miss_v)}）→ 拒用，回落 npz 自带词表")
+                elif _use:
+                    from .vocab_mmap import VocabMmap
+                    _cand = None
+                    try:
+                        _cand = VocabMmap(_carrier)
+                        if expected_v is None:
+                            _npz_vocab = z['vocab'].tolist() if 'vocab' in files_set else []
+                            expected_v = len(_npz_vocab)
+                        if len(_cand) == expected_v:
+                            vocab = _cand
+                        else:
+                            _use = False
+                            _cand.close()
+                    except Exception as _ve:                # noqa: BLE001
+                        _use = False
+                        if _cand is not None:
+                            _cand.close()
+                        log(f"[WARN] `.vocab/` 侧车损坏（{_ve!r}）→ 拒用，回落 npz 自带词表")
+                if not _use and not _miss_v:
+                    log(f"[WARN] 词表载体与 npz 不同代/长度不符 → 拒用，回落 npz 自带词表"
+                        f"（盘上={_got[:36] or '(缺键)'} · 期望={_cur_gen[:36]}）")
+            if vocab is None:
+                if _npz_vocab is None:
+                    _npz_vocab = z['vocab'].tolist() if 'vocab' in files_set else []
+                vocab = _npz_vocab
+
+            bm = cls.__new__(cls)
+            bm._rw = RWLock()                    # `load` 走 `__new__`, 并发原语要在这里补建
+            bm._cache_mu = threading.RLock()
+            bm.W = bm.Wc = None
+            if has_w:
+                bm.W = csr_matrix((z['W_data'], z['W_idx'], z['W_ptr']),
+                                  shape=(int(w_shape_arr[0]), int(w_shape_arr[1])))
+                bm.Wc = bm.W.tocsc()   # 旧格式: 重建 CSC 缓存 (一次 O(nnz), 与旧 load 相同)
+            bm.N = n_rows
+            bm.idx2term = vocab
+            bm.term2idx = vocab if hasattr(vocab, "id_of") else {t: i for i, t in enumerate(vocab)}
+            bm._vocab_carrier = vocab if hasattr(vocab, "id_of") else None   #  两阶段 attach_hot 用
+            bm._index_path = str(path)          #  共享 CSC 的 key 用（`_tc_key`）
+            bm._tc_shared_info = None
+            bm._mm_postings = None
+            bm._mm_mmaps = []
+            bm._closed = False
+            bm.T = bm.df = bm._idf = None
+            bm._dead = None
+            bm._views = {}             # 接口 C: 视图不持久化（派生层，可由 sidecar 重挂）
+            bm._Tbuf = None            # 01e: 首次 append 时一次性换预分配后端
+            bm._tc_blocks = []         # 01e-C: 分块 CSC (有 T 时在下面建块0)
+            bm._tc_rows = 0
+            # 建库分词档: 缺字段 = 旧版索引, 按内存最高的默认档 `off` 处理。
+            bm.stream_mode = str(z['stream_mode'][0]) if 'stream_mode' in files_set else "off"
+            bm.tokenizer_mode = str(z['tokenizer_mode'][0]) if 'tokenizer_mode' in files_set else "zh_default"
+            params_arr = z['params'] if 'params' in files_set else None
+
+            _dl_mm = None
+            if has_t and _mm_ok:
+                try:
+                    _dl_cand = np.load(_mmd / "dl.npy", mmap_mode="r")
+                    if len(_dl_cand) == n_rows:
+                        _dl_mm = _dl_cand
+                    else:
+                        _close_memmap(_dl_cand)
+                        _mm_ok = False
+                        log(f"[WARN] `.mm/dl.npy` 长度 {len(_dl_cand)} ≠ N={n_rows} → 拒用 `.mm/`")
+                except Exception as _de:                      # noqa: BLE001
+                    _mm_ok = False
+                    log(f"[WARN] `.mm/dl.npy` 不可读（{_de!r}）→ 拒用 `.mm/`")
+
+            if _dl_mm is not None:
+                bm.dl = _dl_mm
+                bm.avgdl = float(params_arr[2]) if params_arr is not None else float(bm.dl.sum()) / max(n_rows, 1)
+                bm.k1, bm.b = (float(params_arr[0]), float(params_arr[1])
+                               if params_arr is not None else (1.5, 0.75))
+            elif 'dl' in files_set:
+                _z_dl = z['dl']
+                if len(_z_dl) == n_rows:
+                    bm.dl = _z_dl.astype(np.float32)
+                    bm.avgdl = float(params_arr[2]) if params_arr is not None else float(bm.dl.sum()) / max(n_rows, 1)
+                    bm.k1, bm.b = (float(params_arr[0]), float(params_arr[1])
+                                   if params_arr is not None else (1.5, 0.75))
+                else:
+                    # 旧版索引无 dl: 从 CSR 按行还原 (O(nnz), 比伪 dl=0/avgdl=1.0 诚实)
+                    log("[WARN] 索引缺 dl, 从 nnz 按行还原 (旧版格式)")
+                    bm.dl = np.diff(bm.W.indptr).astype(np.float32)
+                    bm.avgdl = float(bm.dl.sum()) / max(n_rows, 1)
+                    bm.k1, bm.b = 1.5, 0.75
+            else:
+                log("[WARN] 索引缺 dl, 从 nnz 按行还原 (旧版格式)")
+                bm.dl = np.diff(bm.W.indptr).astype(np.float32)
+                bm.avgdl = float(bm.dl.sum()) / max(n_rows, 1)
+                bm.k1, bm.b = 1.5, 0.75
+
+            if has_t:
+                # v2/v3: 恢复 tf/df 原语 → 增量可用; 分块 CSC 块0 = 旧 `Tc = T.tocsc()` 等价物
+                if t_shape_arr is not None:
+                    Tshape = (int(t_shape_arr[0]), int(t_shape_arr[1]))
+                else:
+                    Tshape = (int(w_shape_arr[0]), int(w_shape_arr[1]))
+                if _mm_ok:
+                    _td = _td_mm if _td_mm is not None else np.load(_mmd / "T_data.npy", mmap_mode="r")
+                    _ti = np.load(_mmd / "T_idx.npy", mmap_mode="r")
+                    _tp = np.load(_mmd / "T_ptr.npy", mmap_mode="r")
+                    bm.T = csr_matrix((_td, _ti, _tp), shape=Tshape, copy=False)
+                    bm._mm_postings = (_td, _ti, _tp)
+                    _pi, _pd = _mmd / "idf.npy", _mmd / "dead.npy"
+                    bm._idf = np.load(_pi, mmap_mode="r")
+                    bm._mm_mmaps = [_td, _ti, _tp, bm._idf, bm.dl]
+                    if _pd.exists():
+                        # 必须拷成可写：`_tombstone_rows` 要就地写 `_dead[r] = True`, 而 mmap 只读,
+                        #    否则"落盘→重载→再更新"会报 `ValueError: assignment destination is read-only`。
+                        _dead_mm = np.load(_pd, mmap_mode="r")
+                        bm._dead = np.array(_dead_mm, dtype=bool, copy=True)
+                        _close_memmap(_dead_mm)
+                    #  `df` 仍来自 npz：`_tombstone_rows` 会原地写它（只读 mmap 会当场报错）
+                    bm.df = z['df'].astype(np.int32) if 'df' in files_set else None
+                    #  ⭐ X13（2026-11-18）：`.mm` 在场 ⇒ postings 本来就留盘 mmap。加载期不再
+                    #    eager `tocsc()` —— 那是一次 O(nnz) 拷贝（@1M ≈330 MB + ~0.5 s），
+                    #    会把 mmap 的懒页**当场全部打穿**，冷启仍是 O(nnz)。
+                    #    CSC 改由首查的 `_ensure_tc()` 补建（空块 → 全量 tocsc，见
+                    #    `_ensure_tc_locked`；@1M ≈0.5 s，一次性）。
+                    #    `EAGER_TC` 开关继续管 **npz 直读路径**（那条本来就已付 nnz 读取）。
+                    log("S1 postings 走 mmap · CSC 推到首查（.mm 在场 ⇒ 加载期不碰 postings 页）"
+                        + ("（TC_SHARED → 首查时发布/attach 共享段）" if cls.TC_SHARED else ""))
+                else:
+                    _close_memmap(_td_mm)
+                    _close_memmap(_dl_mm)
+                    bm.T = csr_matrix((z['T_data'], z['T_idx'], z['T_ptr']), shape=Tshape)
+                    bm._tc_blocks = [(bm.T.tocsc(), 0)]
+                    bm._tc_rows = int(Tshape[0])
+                    bm.df = z['df'].astype(np.int32) if 'df' in files_set else None
+                    bm._idf = z['_idf'].astype(np.float32) if '_idf' in files_set else None
+                    d = z['dead'] if 'dead' in files_set and z['dead'].size else None
+                    bm._dead = d.astype(bool) if d is not None else None
+            else:
+                _close_memmap(_td_mm)
+                _close_memmap(_dl_mm)
+            nnz = (bm.T.nnz if bm.T is not None
+                   else (bm.W.nnz if bm.W is not None else 0))
+            # 01h：盘上有没有可用的物化层 `w`？—— 内容型键比对（不一致一律拒用）
+            bm._w_persist_dir = None
+            bm._w_persist_ok = False
+            bm._w_from_disk = False
+            try:
+                _wd = _Path(str(path) + ".mm")
+                _wk = _wd / "w_key.txt"
+                if bm.T is not None and _wk.exists() and list(_wd.glob("w_*.npy")):
+                    _want = bm._w_persist_key()
+                    _got = _wk.read_text(encoding="utf-8").strip()
+                    if _got == _want:
+                        bm._w_persist_dir = str(_wd)
+                        bm._w_persist_ok = True
+                        log(f"S1 物化层 w 可用（键相符 → 首查直接 mmap，不必重建）")
+                    else:
+                        log(f"[WARN] 盘上 w 的键不符 → 拒用（不回退静默！）·"
+                            f" 盘上={_got} · 当前={_want}")
+            except Exception as _e:                                    # noqa: BLE001
+                log(f"[WARN] 物化层 w 探测跳过: {_e!r}")
+            log(f"S1 从 {path} 加载索引 (fmt={fmt}, nnz={nnz}, 词表 {len(vocab)}, "
+                f"avgdl={bm.avgdl:.1f}, k1={bm.k1}, b={bm.b}"
+                + (", tf原语就绪" if bm.T is not None else ", tf原语缺失(v1, 增量不可用)"))
+            return bm
+
+    def close(self) -> None:
+        """显式释放 `.mm/` memmap、`.vocab/` mmap、共享 CSC 与预化层 `w` 句柄（幂等）。"""
+        mu = getattr(self, "_cache_mu", None)
+        if mu is not None:
+            mu.acquire()
+        try:
+            self._tc_blocks = []
+            self._tc_rows = 0
+            wb = getattr(self, "_w_blocks", None)
+            if wb:
+                for arr in wb:
+                    _close_memmap(arr)
+                self._w_blocks = None
+            self._w_key_val = None
+            info = getattr(self, "_tc_shared_info", None)
+            if isinstance(info, dict) and info.get("shm") is not None:
+                try:
+                    info["shm"].close()
+                except Exception:
+                    pass
+            self._tc_shared_info = None
+            for arr in getattr(self, "_mm_mmaps", ()) or ():
+                _close_memmap(arr)
+            if hasattr(self, "_mm_mmaps"):
+                self._mm_mmaps = []
+            for arr in getattr(self, "_mm_postings", ()) or ():
+                _close_memmap(arr)
+            if getattr(self, "_mm_postings", None) is not None:
+                self._mm_postings = None
+                self.T = None
+            _close_memmap(getattr(self, "_idf", None))
+            _close_memmap(getattr(self, "dl", None))
+            vc = getattr(self, "_vocab_carrier", None)
+            if vc is not None:
+                try:
+                    vc.close()
+                except Exception:
+                    pass
+                self._vocab_carrier = None
+                cur_i2t = getattr(self, "idx2term", None)
+                cur_t2i = getattr(self, "term2idx", None)
+                if cur_i2t is vc or getattr(cur_i2t, "base", None) is vc:
+                    self.idx2term = []
+                if cur_t2i is vc or getattr(cur_t2i, "base", None) is vc:
+                    self.term2idx = {}
+            self._closed = True
+        finally:
+            if mu is not None:
+                mu.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

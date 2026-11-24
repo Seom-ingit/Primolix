@@ -35,9 +35,7 @@ deriv/csc/
 seg/
 *.csc.npz
 # scratch dirs created when the shipped tests / examples run
-tests/_unit_run/
-tests/_e2e_run/
-tests/_staged_run/
+tests/_*_run/
 
 # ---------------------------------------------------------------- 维护者资产（不进公开仓）
 # 一次性迁移/诊断脚本与内部清单：含绝对路径、workspace 进度文件引用与维护者自用步骤，

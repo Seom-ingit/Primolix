@@ -58,24 +58,45 @@ class Index:
         self._z._persist()
 
     # ---------------------------------------------------------------- 读
-    def search(self, q: str, k: int = 10, *, dense: bool = False) -> list[dict]:
-        """检索：文本进、结果出（自动分词）。返回 `[{rank, score, docid, file, line, text}]`。
+    def search(self, q: str, k: int = 10, *, dense: bool = False,
+               rerank=False, pool_k: int = 100, dense_union: bool = False,
+               dense_k: int = 100, span: bool = False,
+               confidence: bool = False) -> list[dict]:
+        """检索：文本进、结果出（自动分词）。返回 `[{rank, score, docid, file, line, text, ...}]`。
 
-        `docid` 是 additive 字段（2026-10-18 乙档）：段内文档常常没有真实 `file/line`，
-        只靠 `file/line` 认不出来。
+        - `dense_union=True`（严格可选）：若 `views/dense_int8` 与编码器就绪，走 `BM25 ∪ INT8` 并池检索；
+          缺侧车或缺模型时自动优雅降级纯 BM25，不报错。
+        - `rerank`（0.3）：`True` / 模型路径 / `Reranker` → 池内 `pool_k` 语义重排；缺模型时诚实降级。
+        - `span=True`：附加 `hit_span` / `hit_ranges` 及源文档 `char_start` / `char_end`。
+        - `confidence=True`（支线 #15）：附加有界原语置信度 `hit['confidence']` 并更新 `confidence_status()`。
         """
         with self._lock.read():
-            return self._z.query(q, k=k, dense=dense)
+            return self._z.query(q, k=k, dense=dense, rerank=rerank, pool_k=pool_k,
+                                 dense_union=dense_union, dense_k=dense_k,
+                                 span=span, confidence=confidence)
+
+    def confidence_status(self) -> dict | None:
+        """最近一次 `search(..., confidence=True)` 的查询级置信度摘要。"""
+        with self._lock.read():
+            st = getattr(self._z, "last_confidence", None)
+            return dict(st) if st is not None else None
 
     def search_batch(self, qs, k: int = 10, *, dense: bool = False,
-                     with_text: bool = True) -> list[list[dict]]:
-        """批量检索：**一次**进读锁，逐条与 `search` 同语义。
+                     with_text: bool = True, rerank=False,
+                     pool_k: int = 100, span: bool = False) -> list[list[dict]]:
+        """批量检索：**一次**进读锁；开启 `rerank` 时对整批候选去重并流式编码。
 
         `with_text=False` ⇒ 命中项不带 `text`（评测/管道场景，免掉每命中一条拷一段全文）。
-        `dense` 臂逐条等价 `search(q, dense=True)`。
         """
         with self._lock.read():
-            return self._z.query_many(list(qs), k=k, dense=dense, with_text=with_text)
+            return self._z.query_many(list(qs), k=k, dense=dense, with_text=with_text,
+                                      rerank=rerank, pool_k=pool_k, span=span)
+
+    def rerank_status(self) -> dict | None:
+        """最近一次 `rerank` / `dense` 查询的执行与降级状态（`mode`/`available`/`ceiling_note`）。"""
+        with self._lock.read():
+            st = getattr(self._z, "last_rerank_status", None)
+            return dict(st) if st is not None else None
 
     def stats(self) -> dict:
         """索引概览：规模 ＋ 落盘大小 ＋ 开关 ＋ 段/视图计数。"""
@@ -92,6 +113,84 @@ class Index:
             )
             return info
 
+    def warmup(self, *, shared: bool | None = None) -> dict:
+        """预热查询结构（0.4 P2）：父进程统一初始化共享 CSC (`shared=True`)，避免多 worker 私有加载 OOM。"""
+        with self._lock.write():
+            bm = self._z._bm
+            if bm.T is None:
+                return dict(shared=False, owner=False, name=None, bytes=0,
+                            blocks=len(getattr(bm, "_tc_blocks", []) or []), tc_key=None)
+            want_shared = bool(SparseBM25.TC_SHARED if shared is None else shared)
+            with bm._cache_mu:
+                cur_info = getattr(bm, "_tc_shared_info", None)
+                already_shared = isinstance(cur_info, dict) and bool(cur_info.get("shared"))
+                if want_shared and not already_shared and not bm.segment_report():
+                    bm._tc_blocks = []
+                    bm._tc_rows = 0
+                bm._ensure_tc(shared=want_shared)
+            info = getattr(bm, "_tc_shared_info", None)
+            s_ok = isinstance(info, dict) and bool(info.get("shared"))
+            return dict(
+                shared=s_ok,
+                owner=(bool(info.get("owner")) if s_ok else False),
+                name=(info.get("name") if s_ok else None),
+                bytes=(int(info.get("bytes", 0)) if s_ok else 0),
+                blocks=len(getattr(bm, "_tc_blocks", []) or []),
+                tc_key=(bm._tc_key() if s_ok else None),
+                reason=(info.get("reason") if isinstance(info, dict) else None),
+            )
+
+    def health(self) -> dict:
+        """健康度自省：暴露死行比例、分块数、未合并 delta、词表载体、共享内存与压实建议。"""
+        with self._lock.read():
+            st = self.stats()
+            bm = self._z._bm
+            n_total = int(getattr(bm, "N", 0) or 0)
+            dead_n = int(bm._dead.sum()) if getattr(bm, "_dead", None) is not None else 0
+            n_live = max(n_total - dead_n, 0)
+            dead_ratio = (dead_n / float(n_total)) if n_total > 0 else 0.0
+            delta_files = int(getattr(self._z, "_delta_count", 0) or 0)
+            delta_nnz = int(getattr(self._z, "_delta_nnz", 0) or 0)
+            blocks = int(st.get("blocks", 0) or 0)
+            segments = int(st.get("segments", 0) or 0)
+            v_rep = bm.view_report()
+            tc_info = getattr(bm, "_tc_shared_info", None)
+            tc_status = (
+                dict(
+                    enabled=bool(SparseBM25.TC_SHARED),
+                    shared=bool(tc_info.get("shared")),
+                    owner=bool(tc_info.get("owner")),
+                    name=tc_info.get("name"),
+                    bytes=int(tc_info.get("bytes", 0)),
+                )
+                if isinstance(tc_info, dict)
+                else dict(enabled=bool(SparseBM25.TC_SHARED), shared=False, owner=False, name=None, bytes=0)
+            )
+            reasons = []
+            if segments > 0:
+                reasons.append(f"mounted_segments={segments}")
+            if dead_ratio >= 0.2:
+                reasons.append(f"dead_ratio={dead_ratio:.2%}")
+            if delta_files >= 8:
+                reasons.append(f"delta_files={delta_files}")
+            return dict(
+                N=n_total,
+                n_live=n_live,
+                dead=dead_n,
+                dead_ratio=dead_ratio,
+                V=int(getattr(bm, "V", 0) or 0),
+                vocab_carrier=type(getattr(bm, "idx2term", None)).__name__,
+                blocks=blocks,
+                segments=segments,
+                delta_files=delta_files,
+                delta_nnz=delta_nnz,
+                tc_shared=tc_status,
+                views=v_rep,
+                rerank_status=self.rerank_status(),
+                compact_recommended=bool(reasons),
+                compact_reasons=reasons,
+            )
+
     def files(self) -> list[str]:
         with self._lock.read():
             return self._z.list_files()
@@ -104,22 +203,22 @@ class Index:
                 diagnose: bool = False):
         """归因：把第 `k` 名的分数按词拆成 `idf × tf 饱和 × 文档长度` 的贡献。
 
-        `docid` 给定时拆那一篇（按文件名片段匹配，全库找、取该文件分最高的 chunk），
+        `docid` 给定时拆那一篇（按文件名片段匹配，**全库找**、取该文件分最高的 chunk），
         否则拆当前第 `k` 名。
 
-        2026-10-19 补两处（此前这两问答不了）：
-        1. 词表外（OOV）不再被静默跳过：显式出现在返回列表里（`in_vocab=False`、
-           `contribution=0.0`），且不受 `top` 截断 —— 产品上「这个词你的库里没有」
+        ⭐ **2026-10-19 补两处**（此前这两问答不了）：
+        1. **词表外（OOV）不再被静默跳过**：显式出现在返回列表里（`in_vocab=False`、
+           `contribution=0.0`），且**不受 `top` 截断** —— 产品上「这个词你的库里没有」
            是最要紧的一句，不能被 `top` 挤掉。
-        2. 没搜到时不再只返回空 list：`diagnose=True` ⇒ 返回
+        2. **没搜到时不再只返回空 list**：`diagnose=True` ⇒ 返回
            `dict(contributions=[...], diagnosis={...})`，`diagnosis` 说清为什么没搜到。
            默认仍返回 `list`（向后兼容现存调用方）；只想看诊断可直接调 `diagnose()`。
 
-        `top` 只限制有贡献的词条数；`status` 为 `oov` / `no_tf` / `unavailable`
-        的项必出（它们解释的是"为什么这个词没帮上忙"）。
+        ⚠️ `top` 只限制**有贡献**的词条数；`status` 为 `oov` / `no_tf` / `unavailable`
+        的项**必出**（它们解释的是"为什么这个词没帮上忙"）。
         """
         with self._lock.read():
-            qtoks = zh_tokenize(q)
+            qtoks = self._z._tok_fn()(q)
             s = self._z._score_active(qtoks)
             if docid:
                 files = self._z._meta.files           # ⭐ X13：只读 file 的扫走紧凑列表
@@ -130,17 +229,19 @@ class Index:
                 row = int(max(rows, key=lambda i: float(s[i])))
             else:
                 # 无正分 ⇒ 没有"第 k 名"可拆。旧实现在这里 `return []`，
+                # 把「为什么一条都没有」这个最高频的问题答成了空白。
                 if s.size == 0 or not bool((s > 0).any()):
                     return (dict(contributions=[], diagnosis=self._diagnose(q, k, s, qtoks))
                             if diagnose else [])
                 order = _topk_idx(s, max(int(k), 1))
                 row = int(order[min(max(int(k), 1), len(order)) - 1])
             bm = self._z._bm
-            dl, avg, n = float(bm.dl[row]), float(bm.avgdl), int(bm.N)
+            dl, avg = float(bm.dl[row]), float(bm.avgdl)
+            n_live = int(self._z._active_rows().size) or 1
             avg = avg if avg > 0 else 1.0          # 空索引/单文档时 avgdl 可能为 0
             T = bm.T.tocsr() if bm.T is not None else None
             nT = int(T.shape[0]) if T is not None else 0
-            # 段内文档（未折叠）的物理行不在主表 `T` 里 ⇒ 去分块里取 tf（否则 `T[row, c]` 越界）
+            # ⭐ 段内文档（未折叠）的物理行不在主表 `T` 里 ⇒ 去分块里取 tf（否则 `T[row, c]` 越界）
             blk = None
             for _c, _rb in (getattr(bm, "_tc_blocks", []) or []):
                 if int(_rb) <= row < int(_rb) + int(_c.shape[0]):
@@ -155,7 +256,9 @@ class Index:
                                       contribution=0.0))
                     continue
                 df = float(bm.df[c])
-                idf = float(np.log((n - df + 0.5) / (df + 0.5) + 1.0))
+                idf = (float(bm._idf[c])
+                       if getattr(bm, "_idf", None) is not None and c < bm._idf.size
+                       else float(np.log((n_live - df + 0.5) / (df + 0.5) + 1.0)))
                 if T is not None and row < nT:
                     tf = float(T[row, c])
                 elif blk is not None:
@@ -184,13 +287,13 @@ class Index:
         """（内部）**为什么没搜到** / 为什么只搜到这些 —— 只输出有把握的判断。
 
         每条 `messages[*]` 都带 `evidence`（可点开验证的实数）与 `action`（人话动作），
-        符合本层「不许静默、解释必须可举证」的约定。不猜：拿不到的数一律不编。
+        符合本层「不许静默、解释必须可举证」的约定。**不猜**：拿不到的数一律不编。
         """
-        qtoks = list(qtoks if qtoks is not None else zh_tokenize(q))
+        qtoks = list(qtoks if qtoks is not None else self._z._tok_fn()(q))
         s = self._z._score_active(qtoks) if s is None else s
         bm = self._z._bm
-        n = int(bm.N) or 1
         n_active = int(self._z._active_rows().size)
+        n_live = n_active or 1
         terms, oov = [], []
         for t, c0 in Counter(qtoks).items():
             ci = bm.term2idx.get(t)
@@ -200,9 +303,11 @@ class Index:
                                   df=0, df_ratio=None, idf=None))
                 continue
             df = int(bm.df[ci])
-            idf = float(np.log((n - df + 0.5) / (df + 0.5) + 1.0))
+            idf = (float(bm._idf[ci])
+                   if getattr(bm, "_idf", None) is not None and ci < bm._idf.size
+                   else float(np.log((n_live - df + 0.5) / (df + 0.5) + 1.0)))
             terms.append(dict(term=t, q_count=int(c0), in_vocab=True, df=df,
-                              df_ratio=round(df / n, 6), idf=round(idf, 6)))
+                              df_ratio=round(df / n_live, 6), idf=round(idf, 6)))
         n_pos = int((s > 0).sum()) if s.size else 0
         if not qtoks:
             status = "no_tokens"
@@ -266,7 +371,8 @@ class Index:
             return self._diagnose(q, k=k)
 
     # ---------------------------------------------------------------- 写
-    def add(self, root: str, *, workers: int = 0, verify: str = "auto") -> dict:
+    def add(self, root: str, *, workers: int = 0, verify: str = "auto",
+            skip_dirs=None) -> dict:
         """增量：只处理改动过的文件，走 `Primolix.update()` 的路由（见 `04c` 判据件）。
 
         四个出口（`kind`）：`noop` / `incremental` / `staged` / `rebuild`。
@@ -275,7 +381,7 @@ class Index:
         段在场时：含新词 → 还能再挂一段（`staged`）；词表内 → 先自动折叠再增量。
         """
         with self._lock.write():
-            return self._z.update(root, workers=workers, verify=verify)
+            return self._z.update(root, workers=workers, verify=verify, skip_dirs=skip_dirs)
 
     def rebuild(self, root: str, *, workers: int = 0, force: bool = False) -> dict:
         """整库重建到同一目录（词表外回退 / 显式重建）。
@@ -286,15 +392,26 @@ class Index:
             self._z.rebuild_in_place(root, workers=workers, force=force)
             return dict(kind="rebuild", force=bool(force), files=len(self._z._hashes))
 
+    TUNE_PRESETS = {
+        "default": (1.5, 0.75),
+        "zh_short": (0.6, 0.75),   # 08_k1b调参封顶（1M 中文全量 MRR 0.27937 → 0.29797）
+    }
+
     def tune(self, *, k1: float | None = None, b: float | None = None,
-             persist: bool = False) -> dict:
+             preset: str | None = None, persist: bool = False) -> dict:
         """换公式：`k1` / `b` 是两次属性赋值，不重建、不动物料。
 
+        `preset` 可选 `"default"` (1.5, 0.75) 或 `"zh_short"` (0.6, 0.75)；
         `persist=True` 时把新参数写回索引（否则只在本进程生效 —— 与内核语义一致）。
         """
         with self._lock.write():
             bm = self._z._bm
             before = dict(k1=float(bm.k1), b=float(bm.b))
+            if preset is not None:
+                if preset not in self.TUNE_PRESETS:
+                    raise ValueError(f"未知 preset {preset!r}；可选 {sorted(self.TUNE_PRESETS)}")
+                pk1, pb = self.TUNE_PRESETS[preset]
+                bm.k1, bm.b = float(pk1), float(pb)
             if k1 is not None:
                 bm.k1 = float(k1)
             if b is not None:
@@ -302,7 +419,7 @@ class Index:
             if persist:
                 self._need_save()
             return dict(before=before, after=dict(k1=float(bm.k1), b=float(bm.b)),
-                        persisted=bool(persist))
+                        preset=preset, persisted=bool(persist))
 
     def config(self, **kw) -> dict:
         """读/写开关。开关是类属性 → 进程级（改了会影响本进程里所有索引）。"""
@@ -321,9 +438,9 @@ class Index:
                                              generation=generation)
 
     def unmount(self, tag: str) -> dict:
-        """撤回一个已挂的段（分数逐位回到挂载前）。已折叠的段不能撤。"""
+        """撤回一个已挂的段（分数逐位回到挂载前，并同步清理旁车与 `_meta`）。已折叠的段不能撤。"""
         with self._lock.write():
-            return self._z._bm.unmount_segment(tag)
+            return self._z.unmount_segment(tag)
 
     def fold(self, tag: str) -> dict:
         """把已挂的段并进主表（一次 `O(nnz)`；折叠前后分数不变 → 段不再存在）。"""
@@ -336,23 +453,28 @@ class Index:
             return dict(mounted=self._z._bm.segment_report(),
                         folded=self._z._bm.folded_report())
 
-    def compact(self) -> dict:
-        """压实：把已挂段全部折进主表 ＋ **落盘** ＋ 清分块缓存 → 查询恢复单块。
+    def compact(self, mode: str = "auto") -> dict:
+        """统一压实（0.4 P1）：支持 `'auto'` / `'delta'` / `'full'` / `'segments'`。
 
-        查询耗时随分块数上升，长期只追加会把块数堆起来；折叠是一次 `O(nnz)`，折完只走主表。
-        内核不变量 `fold_segment` 断言"折完 T 行数 == N"（`N` 含所有已挂段）→ 多段时用不了
-        `fold_segment`，这里改走 `fold_all()`。
-
-        必须先 `_persist()` 再写 `folded_all` 事件（2026-10-18 修）：折叠改的是内存里的 `T`，
-        段的内容不在源语料里 ⇒ 不落盘就写提交事件，重载时 npz 里没有那些行、旁车却说"已折叠"
-        ⇒ 段内容静默丢失（`_meta` 也一起丢）。顺序落盘→提交：崩溃只留"已落盘、旁车仍说在挂"，
-        重载时 `remount_staged` 会因 `T.shape[0] > row_base` 判为已折叠而跳过 ⇒ 安全。
+        - `'auto'`：依据 `health()` 口径自动选择折叠段 / 回收墓碑 (`dead_ratio >= 0.2`) / Tier-1 delta 合并；
+        - `'delta'`：只合 `.delta/*.npz`（及段转 delta），不重写基线 `bm25.npz`；
+        - `'full'`：全量折叠 + 物理回收死行 + 双缓冲安全落盘。
         """
         with self._lock.write():
-            out = self._z.compact_segments()      # 与 update() 的 `fold_first` 出口共用
-            return dict(folded=out["folded"], blocks=out["blocks"], N=out["N"],
-                        V=out["V"], ms=out["ms"], via=out["via"],
-                        tags=out["tags"])
+            out = self._z.compact(mode=mode)
+            return dict(
+                mode=out.get("mode", mode),
+                folded=out["folded"],
+                blocks=out["blocks"],
+                N=out["N"],
+                V=out["V"],
+                ms=out["ms"],
+                via=out["via"],
+                tags=out["tags"],
+                reclaimed_dead=out.get("reclaimed_dead", 0),
+                merged_deltas=out.get("merged_deltas", 0),
+                delta_files=out.get("delta_files", 0),
+            )
 
     # ---------------------------------------------------------------- 临时段发布
     def stage_begin(self, tag: str | None = None, *, generation: str | None = None) -> "Stage":
@@ -397,12 +519,12 @@ class Index:
              k: int = 10) -> list[dict]:
         """稀疏 ＋ 稠密融合打分（覆盖行分数单调不降），返回 top-k。
 
-        01m（P-B）：三处换成缓存/单趟 —— ① `_active_rows()`（不再每次用 Python
-        列表推导重建行号数组：@1M 那是 70.28 ms/次 的写法）；② 行分只 gather 一次
-        （改前每返回一行都再 `s[rows[j]]` 一次）；③ `_topk_idx`（P-O3：采样定阈 → 候选内
+        ⭐ **01m（P-B）**：三处换成缓存/单趟 —— ① `_active_rows()`（⛔ 不再每次用 Python
+        列表推导重建行号数组：@1M 那是 **70.28 ms/次** 的写法）；② 行分只 gather **一次**
+        （改前每返回一行都再 `s[rows[j]]` 一次）；③ `_topk_idx`（⭐ P-O3：采样定阈 → 候选内
         `argpartition`；`TOPK_APPROX=False` 时退回整段 `argpartition`）替代
-        全量 `argsort`。并列时取哪几行本就不保证（`_topk_idx` 契约），与 `core.query`
-        口径一致；判据盯的是选出的 k 个分数值多重集逐位相同。
+        全量 `argsort`。⚠️ 并列时**取哪几行**本就不保证（`_topk_idx` 契约），与 `core.query`
+        口径一致；判据盯的是**选出的 k 个分数值多重集逐位相同**。
         """
         with self._lock.read():
             z = self._z
@@ -425,6 +547,33 @@ class Index:
         with self._lock.write():
             return self._z.load_views(extra_dirs)
 
+    # ---- M1（契约 §2）：rerank 缓存视图的显式落盘 / 显式热区预热（锁内薄转发） ----
+    def persist_view(self, name: str = "rerank_cache", *, max_vectors=None) -> dict:
+        """把内存视图（活行 + LRU 封顶）写回 `<dir>/views/<name>.npz`（GC 死向量）。"""
+        with self._lock.write():
+            return self._z.persist_view(name, max_vectors=max_vectors)
+
+    def warm_view(self, files, reranker, *, view_name: str = "rerank_cache",
+                  max_chunks: int = 512) -> dict:
+        """显式热区预热：只编码 `files` 命中的 chunk（⛔ 无后台线程、不扫全仓）。"""
+        with self._lock.write():                   # 会写 `_bm._views` → 独占侧
+            return self._z.warm_view(files, reranker, view_name=view_name,
+                                     max_chunks=max_chunks)
+
+    def build_dense_int8(self, *, model_path: str = "", device: str = "auto",
+                         sub_batch: int = 256, fp16: bool = True, encoder=None) -> dict:
+        """显式按需构建可选 `views/dense_int8` 紧凑侧车；缺模型时诚实返回降级状态。"""
+        with self._lock.write():
+            return self._z.build_dense_int8(
+                model_path=model_path, device=device, sub_batch=sub_batch,
+                fp16=fp16, encoder=encoder,
+            )
+
+    def dense_int8_status(self) -> dict:
+        """查询可选 `views/dense_int8` 侧车的可用性与覆盖率（不抛错）。"""
+        with self._lock.read():
+            return self._z.dense_int8_status()
+
     # ---------------------------------------------------------------- 落盘
     def save(self, path: str | None = None, *, w_cache: bool = False,
              fold_first: bool = False) -> dict:
@@ -445,6 +594,17 @@ class Index:
                             scope="index_dir")
             self._z._bm.save(str(path), w_cache=w_cache)
             return dict(path=str(path), w_cache=bool(w_cache), scope="kernel_only")
+
+    def close(self) -> None:
+        """显式释放索引持有的文件与 mmap 句柄（幂等，支持 `with primolix.open(...) as idx:`）。"""
+        with self._lock.write():
+            self._z.close()
+
+    def __enter__(self) -> "Index":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
 
 # -------------------------------------------------------------------- 入口
@@ -470,15 +630,17 @@ def open_index(path, *, dense: bool = False, model_path: str = "") -> Index:
 
 def build_index(root, out: str = ".primolix_index", *, dense: bool = False,
                 w_cache: bool = False, workers: int = 0,
-                stream=False,
-                model_path: str = "") -> Index:
+                stream=False, code_aware: bool = False,
+                model_path: str = "", skip_dirs=None) -> Index:
     r"""建索引并返回门面对象。`w_cache=True` → 建库时把物化层一并落盘。
 
-    `stream` 只改建库峰值内存、不改分数：`False`（默认）· `True` · `"ids"`（最低档、不重分词）。
-    实测 100k 档 net 峰值 607 / 216 / 234 MB ⇒ 差 2.6–2.8×。
+    `stream` 只改**建库峰值内存**、⛔ 不改分数：`False`（默认）· `True` · ⭐ `"ids"`（最低档、不重分词）。
+    实测 100k 档 net 峰值 607 / 216 / 234 MB ⇒ **差 2.6–2.8×**。
+    `code_aware=True`：启用 `zh_code` 代码标识符子词分词并随索引持久化。
     """
     z = Primolix.build(root, out=out, dense=dense, model_path=model_path,
-                       workers=workers, w_cache=w_cache, stream=stream)
+                       workers=workers, w_cache=w_cache, stream=stream,
+                       code_aware=code_aware, skip_dirs=skip_dirs)
     idx = Index.__new__(Index)                 # 复用刚建好的对象，避免二次装载
     idx.dir = Path(out)
     idx._lock = RWLock()
@@ -516,12 +678,12 @@ class Stage:
     def add(self, docid, text_or_tokens, *, file=None, line=None) -> "Stage":
         """加入一篇：文本（分词一次）或已分好的 token 列表。返回 `self`（可链式）。
 
-        `file` / `line` 可选：段发布时它们会进段级文档身份侧车（`.segments/<tag>/docs.jsonl`），
-        从而在产品层 `search`/`browse` 可见。缺省时用 `docid` 当 `file`、`line=1`（不编造路径）。
-        `text` 记原文（传 token 列表时退化为空格连接，会丢失原文间距）。
+        `file` / `line` 可选：段发布时它们会进**段级文档身份侧车**（`.segments/<tag>/docs.jsonl`），
+        从而在产品层 `search`/`browse` 可见。缺省时用 `docid` 当 `file`、`line=1`（⛔ 不编造路径）。
+        `text` 记原文（传 token 列表时退化为空格连接，⚠️ 会丢失原文间距）。
         """
         raw = text_or_tokens
-        toks = (zh_tokenize(raw) if isinstance(raw, str) else list(raw))
+        toks = (self.idx._z._tok_fn()(raw) if isinstance(raw, str) else list(raw))
         for t in toks:
             if self._has(t) or t in self._new_pos:
                 continue

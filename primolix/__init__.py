@@ -11,13 +11,14 @@ from .kernel import (SparseBM25, zh_tokenize, simple_tokenize,
                      tokenizer_status, log)
 from .core import Primolix
 from .api import Index, RWLock, build_index, open_index
+from .rerank import Reranker
 
-__version__ = "0.2.4"
+__version__ = "0.4.0"
 
 # `open` 会遮蔽内置 `open` → 保留显式 `primolix.open(...)`，但不进 `__all__`。
 open = open_index
 build = build_index
 
-__all__ = ["SparseBM25", "Primolix", "Index", "RWLock",
+__all__ = ["SparseBM25", "Primolix", "Index", "RWLock", "Reranker",
            "build", "build_index", "open_index",
            "zh_tokenize", "simple_tokenize", "tokenizer_status", "log"]

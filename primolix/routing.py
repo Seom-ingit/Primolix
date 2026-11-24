@@ -1,6 +1,6 @@
 """路由判定：`update()` 这一批该怎么走。
 
-纯函数、无 I/O、无全局可变状态：只判定，不执行。
+纯函数、无 I/O、无全局可变状态：**只判定，不执行**。
 判据件：`04c_丙档OOV路由_设计与判据_2026-11-08.md`。
 
 五个出口：
@@ -16,7 +16,7 @@
      ⇒ 连纯删除也要先折。
 
 `fold_first` 就是这两条的统一出口（0.2.1 起）：不再对调用方抛"先 compact()"，
-而是当场折、把折叠耗时如实报账。
+而是**当场折、把折叠耗时如实报账**。
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ FOLD_FIRST = "fold_first"
 
 EXITS = (NOOP, INCREMENTAL, STAGED, REBUILD, FOLD_FIRST)
 
-# ---- 原因码（单测与日志都按它断言，不要拿 detail 文案当契约） ----------
+# ---- 原因码（单测与日志都按它断言，⛔ 不要拿 detail 文案当契约） ----------
 R_NOOP = "noop"
 R_INCREMENTAL = "incremental"
 R_STAGED = "staged"
@@ -40,7 +40,8 @@ R_FOLD_BLOCKS = "fold_then_staged_blocks"
 R_FOLD_TOMB_SEGMENT = "fold_then_tomb_segment"
 R_FOLD_DENSE = "fold_then_rebuild_dense"
 
-# 下面这个默认值没有读数支撑：块数-查询曲线（D3）只在 4.5 万篇 / 17 块上有一点
+# ⚠️ 下面这个默认值**没有读数支撑**：块数-查询曲线（D3）只在 4.5 万篇 / 17 块上有一点
+#    （3.16×），1M 未测 ⇒ [提案]。改它之前先测。
 DEFAULT_COMPACT_BLOCKS = 8
 
 
@@ -54,9 +55,9 @@ def route_update(*, n_added: int = 0, n_changed: int = 0, n_removed: int = 0,
 
     参数（全部是"已数好的量"，函数不做任何扫描）：
         n_added / n_changed / n_removed   hash diff 的三类文件数
-        n_oov                             新增/变更内容里词表外的 token 数
+        n_oov                             新增/变更内容里**词表外**的 token 数
         n_tomb_rows                       本批要墓碑的行数（含段内行）
-        n_tomb_seg_rows                   其中落在段内的行数（段内不支持删除）
+        n_tomb_seg_rows                   其中**落在段内**的行数（段内不支持删除）
         n_segments                        当前已挂段数
         n_blocks                          当前查询块数（含主表块）
         dense_on                          索引是否带 dense 向量
@@ -78,7 +79,7 @@ def route_update(*, n_added: int = 0, n_changed: int = 0, n_removed: int = 0,
     # ---- 先折后走：三条触发（A / C / 墓碑），外加 dense 与段不共存 ----
     if n_segments > 0:
         if int(n_tomb_seg_rows) > 0:
-            # 段内行不可墓碑；折回主表之后就变成普通行了。这条先于 in-vocab 判定，
+            # 段内行不可墓碑；折回主表之后就变成普通行了。这条**先于** in-vocab 判定，
             # 否则"纯删除 + 段内行"会被报成 fold_inplace（原因码失真）。
             return _fold(n_segments, STAGED if wants_stage else INCREMENTAL,
                          R_FOLD_TOMB_SEGMENT,

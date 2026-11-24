@@ -6,6 +6,8 @@
 （不带子命令 = repl）。索引目录由 `--out` 指定，缺省按 `.primolix_index`/`.zelix_index`/`.idx` 自动找。
 Python API 用 `primolix.core.Primolix` / `primolix.api.Index`；本模块只负责命令行与展示。
 """
+from __future__ import annotations
+
 import argparse
 import json
 import re as _re
@@ -157,14 +159,21 @@ def _cmd_query(args):
         raise SystemExit(1)
     z = _load(_find_index(args.out))
     z._model_path = args.model or ''
-    if args.dense and z._vecs is None and (z.dir / 'dense.npy').exists():
-        z._vecs = np.load(z.dir / 'dense.npy')
-    if args.dense and z._vecs is None:
-        _note('索引无 dense.npy, 用 index --dense 重建')
     t0 = time.time()
-    hits = z.query(args.q, k=args.k or 10, dense=args.dense)
+    use_rerank = bool(getattr(args, 'rerank', False))
+    pool_k = int(getattr(args, 'pool_k', 100) or 100)
+    use_span = bool(getattr(args, 'span', False))
+    hits = z.query(args.q, k=args.k or 10, dense=args.dense,
+                   rerank=use_rerank, pool_k=pool_k, span=use_span)
     dt = (time.time() - t0) * 1000
-    tag = 'BM25+dense' if (args.dense and z._vecs is not None) else 'BM25'
+    st = getattr(z, 'last_rerank_status', None) or {}
+    if use_rerank or args.dense:
+        mode = st.get('mode', 'bm25')
+        if mode == 'bm25_fallback' and st.get('reason'):
+            _note(f"已降级 BM25-only（{st['reason']}）")
+        tag = f"BM25+{mode}"
+    else:
+        tag = 'BM25'
     _show_hits(hits, args.q, dt, tag, k=args.k or 10)
 
 
@@ -250,12 +259,14 @@ def _cmd_info(args):
 
 def _cmd_params(args):
     idx = _idx(args)
-    if args.k1 is None and args.b is None:
+    preset = getattr(args, 'preset', None)
+    if args.k1 is None and args.b is None and preset is None:
         s = idx.stats()
         _show_json(dict(k1=s["k1"], b=s["b"], avgdl=s["avgdl"],
-                        note="改参数：--k1/--b（不重建）；--save 写回索引文件"))
+                        presets=sorted(idx.TUNE_PRESETS),
+                        note="改参数：--k1/--b/--preset（不重建）；--save 写回索引文件"))
         return
-    _show_json(idx.tune(k1=args.k1, b=args.b, persist=bool(args.save)))
+    _show_json(idx.tune(k1=args.k1, b=args.b, preset=preset, persist=bool(args.save)))
 
 
 def _cmd_config(args):
@@ -386,6 +397,16 @@ def _cmd_explain(args):
 
 
 def main(argv=None):
+    # ⭐ MCP 薄转发（用户裁定 2026-11-24：MCP 实现只在 `primolix_mcp/` 新包，主包不加子命令、
+    #    不改 argparse）。必须放在 stdout.reconfigure 之前：MCP 自己管 stdio 编码与纯净度。
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == 'mcp':
+        try:
+            from primolix_mcp.server import main as _mcp_main
+        except ImportError:
+            _err('primolix_mcp 未安装（MCP 服务端作为独立包分发，未随 primolix 主包捆绑）。')
+            return 2
+        return _mcp_main(argv[1:])
     # Windows 控制台编码保险
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -409,6 +430,9 @@ def main(argv=None):
     sp.add_argument('--out', default=None)
     sp.add_argument('--k', type=int, default=10)
     sp.add_argument('--dense', action='store_true')
+    sp.add_argument('--rerank', action='store_true', help='0.3 查询期池内重排（零索引编码）')
+    sp.add_argument('--pool-k', dest='pool_k', type=int, default=100, help='重排候选池大小（默认 100）')
+    sp.add_argument('--span', action='store_true', help='返回正文 hit_span 高亮区间')
     sp.add_argument('--model', default='')
     sp = sub.add_parser('update', help='增量同步 (方案A真增量)')
     sp.add_argument('root')
@@ -431,6 +455,7 @@ def main(argv=None):
     sp.add_argument('--out', default=None)
     sp.add_argument('--k1', type=float, default=None)
     sp.add_argument('--b', type=float, default=None)
+    sp.add_argument('--preset', choices=['default', 'zh_short'], default=None)
     sp.add_argument('--save', action='store_true', help='把新参数写回索引文件')
     sp = sub.add_parser('config', help='查看 / 修改开关（进程级）')
     sp.add_argument('--out', default=None)

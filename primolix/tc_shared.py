@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import os
 import struct
 import time
 import zlib
@@ -13,12 +14,14 @@ from scipy.sparse import csc_matrix
 MAGIC = b"ZTCS1"
 HDR = 128
 _KEY_HEX = 40
-_FMT = f"<5s{_KEY_HEX}sQQQQd"        # magic, key_sha1(hex40), n_data, n_ind, n_ptr, state, checksum
+# magic, key_sha1(hex40), n_data, n_ind, n_ptr, state, checksum, owner_pid, build_ts
+_FMT = f"<5s{_KEY_HEX}sQQQQdId"
 assert struct.calcsize(_FMT) <= HDR, "header 放不下"
 _NAME_PREFIX = "primolix_tc_"
 _DT_D, _DT_I, _DT_P = np.float32, np.int32, np.int32   # 发布用的固定 dtype（尺寸因此可先算）
 _STATE_BUILDING, _STATE_READY = 0, 1
 _WAIT_S = 3.0                        # 总等待预算（超时 → 回落私有）
+_STALE_BUILDING_S = 15.0             # 创建者超期未完成 → 视为陈旧锁可抢占
 _FLOOR_MS = 1.0                      # 周期下限（防热自旋）
 # 标定值：换机器/换规模需重标（只用于定周期下限，不参与正确性）。
 _MS_PER_NNZ = 9.2e-6
@@ -88,10 +91,50 @@ def _checksum(d, i, p) -> float:
     return float(_crc32(d, i, p))
 
 
-def _pack(key: str, want, state: int, ck: float) -> bytes:
+def _pid_alive(pid: int) -> bool:
+    """检查创建者进程是否仍存活（Windows 用 OpenProcess+GetExitCodeProcess，POSIX 用 kill(0)）。"""
+    pid = int(pid or 0)
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                err = ctypes.get_last_error()
+                return err == 5  # ERROR_ACCESS_DENIED ⇒ 进程存在但无权查询
+            try:
+                code = wintypes.DWORD(0)
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return False
+                return int(code.value) == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pack(key: str, want, state: int, ck: float,
+          owner_pid: int | None = None, build_ts: float | None = None) -> bytes:
     k = key_sha1(key)
     assert len(k) == _KEY_HEX, f"key 摘要长度 {len(k)} ≠ 字段宽度 {_KEY_HEX} → 会被静默截断"
-    b = struct.pack(_FMT, MAGIC, k.encode("ascii"), want[0], want[1], want[2], state, ck)
+    pid = int(os.getpid() if owner_pid is None else owner_pid)
+    ts = float(time.time() if build_ts is None else build_ts)
+    b = struct.pack(_FMT, MAGIC, k.encode("ascii"), want[0], want[1], want[2], state, ck, pid, ts)
     return b + b"\0" * (HDR - len(b))
 
 
@@ -102,8 +145,9 @@ def _header(shm):
         if not head.strip(b"\0"):
             return "building", None
         return "alien", None
-    magic, k, nd, ni, np_, state, ck = struct.unpack(_FMT, head)
-    h = dict(key=k.decode("ascii", "replace"), n_data=nd, n_ind=ni, n_ptr=np_, state=state, checksum=ck)
+    magic, k, nd, ni, np_, state, ck, owner_pid, build_ts = struct.unpack(_FMT, head)
+    h = dict(key=k.decode("ascii", "replace"), n_data=nd, n_ind=ni, n_ptr=np_,
+             state=state, checksum=ck, owner_pid=int(owner_pid), build_ts=float(build_ts))
     return ("ready" if state == _STATE_READY else "building"), h
 
 
@@ -116,8 +160,11 @@ def _view(shm, want, shape):
     return csc_matrix((d, i, p), shape=shape)
 
 
-def _try_attach(key: str, shape, want=None):
-    """`('ok', (csc, info))` / `('building', None)` / `('alien', None)` / `('none', None)`。"""
+def _try_attach(key: str, shape, want=None, *, verify_crc: bool = True,
+                stale_building_s: float = _STALE_BUILDING_S):
+    """`('ok', (csc, info))` / `('building', None)` / `('stale_building', None)`
+    / `('corrupt', None)` / `('alien', None)` / `('none', None)`。
+    """
     try:
         shm = shared_memory.SharedMemory(name=name_of(key))
     except FileNotFoundError:
@@ -128,8 +175,15 @@ def _try_attach(key: str, shape, want=None):
         shm.close()
         return "alien", None
     if kind == "building":
+        stale = False
+        if h is not None:
+            pid = int(h.get("owner_pid") or 0)
+            bts = float(h.get("build_ts") or 0.0)
+            if (pid > 0 and not _pid_alive(pid)) or (bts > 0.0 and (time.time() - bts) > float(stale_building_s)):
+                stale = True
+                _dbg(f"→ building 锁已陈旧 (pid={pid}, age={time.time() - bts:.2f}s) → 触发抢占")
         shm.close()
-        return "building", None
+        return ("stale_building" if stale else "building"), None
     if h["key"] != key_sha1(key):
         _dbg(f"→ alien(key 不符)：header={h['key']!r} 期望={key_sha1(key)!r}")
         shm.close()
@@ -140,20 +194,84 @@ def _try_attach(key: str, shape, want=None):
         shm.close()
         return "alien", None
     csc = _view(shm, got, shape)
+    if verify_crc:
+        got_ck = _checksum(csc.data, csc.indices, csc.indptr)
+        if got_ck != h["checksum"]:
+            _dbg(f"→ corrupt(crc32 不符)：header={h['checksum']} 实算={got_ck}")
+            del csc
+            shm.close()
+            return "corrupt", None
     return "ok", (csc, dict(shm=shm, owner=False, shared=True, name=name_of(key),
                             bytes=int(shm.size), checksum=h["checksum"],
+                            crc_verified=bool(verify_crc),
                             n_data=got[0], n_ind=got[1], n_ptr=got[2]))
 
 
-def publish_or_attach(T, key: str):
+def _populate_shm(shm, T, key: str, want, shape, per: Period, t_claim: float):
+    """在已持有的 `shm` 上写入 BUILDING 锁 → CSC 数据 → READY 头，返回 `(csc, info)`。"""
+    shm.buf[:HDR] = _pack(key, want, _STATE_BUILDING, 0.0)     # 先声明"建中"
+    _t = time.perf_counter()
+    tc = T.tocsc()                                            # ← 高成本在占位之后
+    t_tocsc = (time.perf_counter() - _t) * 1e3
+    _t = time.perf_counter()
+    d = np.ascontiguousarray(tc.data, dtype=_DT_D)
+    i = np.ascontiguousarray(tc.indices, dtype=_DT_I)
+    p = np.ascontiguousarray(tc.indptr, dtype=_DT_P)
+    t_contig = (time.perf_counter() - _t) * 1e3
+    got = (int(d.size), int(i.size), int(p.size))
+    if got != want:                          # 尺寸预算错了：拆槽位、回落私有（不静默）
+        del tc, d, i, p
+        gc.collect()
+        try:
+            shm.unlink()
+        except Exception:
+            pass
+        try:
+            shm.close()
+        except Exception:
+            pass
+        _dbg(f"尺寸预算不符：预算 {want} 实得 {got}")
+        return None, dict(owner=False, shared=False, reason="size_mismatch",
+                          n_probes=per.n, period_ms=per.period_ms, built_here=True)
+    o = HDR
+    _t = time.perf_counter()
+    for arr in (d, i, p):
+        shm.buf[o:o + arr.nbytes] = arr.tobytes()
+        o += arr.nbytes
+    t_copy = (time.perf_counter() - _t) * 1e3
+    _t = time.perf_counter()
+    ck = _checksum(d, i, p)
+    shm.buf[:HDR] = _pack(key, want, _STATE_READY, ck)          # 数据写好才置"就绪"
+    t_ack = (time.perf_counter() - _t) * 1e3
+    _t = time.perf_counter()
+    csc = _view(shm, want, shape)
+    t_view = (time.perf_counter() - _t) * 1e3
+    _t = time.perf_counter()
+    del tc, d, i, p
+    t_free = (time.perf_counter() - _t) * 1e3
+    info = dict(shm=shm, owner=True, shared=True, name=name_of(key), bytes=int(shm.size),
+                checksum=ck, n_data=want[0], n_ind=want[1], n_ptr=want[2],
+                n_probes=per.n, period_ms=per.period_ms, built_here=True,
+                t_claim_ms=t_claim, t_tocsc_ms=t_tocsc, t_contig_ms=t_contig,
+                t_copy_ms=t_copy, t_ack_ms=t_ack, t_view_ms=t_view, t_free_ms=t_free,
+                build_ms=t_claim + t_tocsc + t_contig + t_copy + t_ack + t_view + t_free)
+    _dbg(f"发布共享（探测 {per.n} 次，周期 {per.period_ms:.2f}ms）")
+    return csc, info
+
+
+def publish_or_attach(T, key: str, *, verify_crc: bool = True,
+                      stale_building_s: float = _STALE_BUILDING_S):
     """`T`(CSR) → 共享的 `csc_matrix`；返回 `(csc, info)`（`csc=None` 时 `info['reason']`）。"""
     shape = (int(T.shape[0]), int(T.shape[1]))
     want, size = csc_sizes(T)
     per = Period(floor_ms=max(_FLOOR_MS, expected_build_ms(T) / 10.0))
     t_end = time.time() + _WAIT_S
+    corrupt_retries = 0
+    stale_preempts = 0
     while True:
         t0 = time.perf_counter()
-        kind, hit = _try_attach(key, shape, want)
+        kind, hit = _try_attach(key, shape, want, verify_crc=verify_crc,
+                                stale_building_s=stale_building_s)
         dt_ms = (time.perf_counter() - t0) * 1e3
         if kind == "ok":
             hit[1].update(n_probes=per.n, period_ms=per.period_ms, built_here=False)
@@ -162,69 +280,45 @@ def publish_or_attach(T, key: str):
         if kind == "alien":
             return None, dict(owner=False, shared=False, reason="alien_segment",
                               n_probes=per.n, period_ms=per.period_ms, built_here=False)
+        if kind in ("corrupt", "stale_building"):
+            if kind == "corrupt":
+                if corrupt_retries >= 1:
+                    return None, dict(owner=False, shared=False, reason="checksum_mismatch",
+                                      n_probes=per.n, period_ms=per.period_ms, built_here=False)
+                corrupt_retries += 1
+            else:
+                if stale_preempts >= 2:
+                    return None, dict(owner=False, shared=False, reason="build_timeout",
+                                      n_probes=per.n, period_ms=per.period_ms, built_here=False)
+                stale_preempts += 1
+            cleanup(key)
+            # POSIX 上 unlink 已摘除旧名；Windows 若仍有对端持句柄，则尝试原地接管同尺寸映射
+            try:
+                _t = time.perf_counter()
+                shm = shared_memory.SharedMemory(name=name_of(key), create=True, size=size)
+                return _populate_shm(shm, T, key, want, shape, per, (time.perf_counter() - _t) * 1e3)
+            except FileExistsError:
+                try:
+                    shm = shared_memory.SharedMemory(name=name_of(key))
+                    if int(shm.size) >= size:
+                        return _populate_shm(shm, T, key, want, shape, per, 0.0)
+                    shm.close()
+                except FileNotFoundError:
+                    pass
+            continue
         if kind == "none":
             #  先占位、后计算：create 只需尺寸（上面已不建算出），失败者一次都不算。
             _t = time.perf_counter()
             try:
                 shm = shared_memory.SharedMemory(name=name_of(key), create=True, size=size)
             except FileExistsError:
-                t_claim = 0.0                            # 撞车，没花钱
                 pass                                     # 别人先占了 → 转等待
             except OSError as e:
                 _dbg(f"create 失败：{e!r}")
                 return None, dict(owner=False, shared=False, reason="create_failed",
                                   n_probes=per.n, period_ms=per.period_ms, built_here=False)
             else:
-                # 命名映射的建立本身是固定成本，单独计时。
-                t_claim = (time.perf_counter() - _t) * 1e3
-                shm.buf[:HDR] = _pack(key, want, _STATE_BUILDING, 0.0)     # 先声明"建中"
-                _t = time.perf_counter()
-                tc = T.tocsc()                                            # ← 高成本在占位之后
-                t_tocsc = (time.perf_counter() - _t) * 1e3
-                _t = time.perf_counter()
-                d = np.ascontiguousarray(tc.data, dtype=_DT_D)
-                i = np.ascontiguousarray(tc.indices, dtype=_DT_I)
-                p = np.ascontiguousarray(tc.indptr, dtype=_DT_P)
-                t_contig = (time.perf_counter() - _t) * 1e3
-                got = (int(d.size), int(i.size), int(p.size))
-                if got != want:                          # 尺寸预算错了：拆槽位、回落私有（不静默）
-                    del tc, d, i, p
-                    gc.collect()
-                    try:
-                        shm.close()
-                        shared_memory.SharedMemory(name=name_of(key)).unlink()
-                    except Exception:
-                        pass
-                    _dbg(f"尺寸预算不符：预算 {want} 实得 {got}")
-                    return None, dict(owner=False, shared=False, reason="size_mismatch",
-                                      n_probes=per.n, period_ms=per.period_ms, built_here=True)
-                o = HDR
-                _t = time.perf_counter()
-                for arr in (d, i, p):
-                    shm.buf[o:o + arr.nbytes] = arr.tobytes()
-                    o += arr.nbytes
-                t_copy = (time.perf_counter() - _t) * 1e3
-                _t = time.perf_counter()
-                ck = _checksum(d, i, p)
-                shm.buf[:HDR] = _pack(key, want, _STATE_READY, ck)          # 数据写好才置"就绪"
-                t_ack = (time.perf_counter() - _t) * 1e3
-                _t = time.perf_counter()
-                csc = _view(shm, want, shape)
-                t_view = (time.perf_counter() - _t) * 1e3
-                _t = time.perf_counter()                 #  计时赋值必须在构造 info 之前
-                #  只 `del`，不做全局 `gc.collect()`：这几个都是局部变量、无循环引用，
-                #  CPython 引用计数会立即释放，全局 GC 扫描纯属白花时间。
-                del tc, d, i, p
-                t_free = (time.perf_counter() - _t) * 1e3
-                info = dict(shm=shm, owner=True, shared=True, name=name_of(key), bytes=int(shm.size),
-                            checksum=ck, n_data=want[0], n_ind=want[1], n_ptr=want[2],
-                            n_probes=per.n, period_ms=per.period_ms, built_here=True,
-                            #  发布路径七个子阶段计时
-                            t_claim_ms=t_claim, t_tocsc_ms=t_tocsc, t_contig_ms=t_contig,
-                            t_copy_ms=t_copy, t_ack_ms=t_ack, t_view_ms=t_view, t_free_ms=t_free,
-                            build_ms=t_claim + t_tocsc + t_contig + t_copy + t_ack + t_view + t_free)
-                _dbg(f"发布共享（探测 {per.n} 次，周期 {per.period_ms:.2f}ms）")
-                return csc, info
+                return _populate_shm(shm, T, key, want, shape, per, (time.perf_counter() - _t) * 1e3)
         per.observe(dt_ms)
         if time.time() > t_end:
             return None, dict(owner=False, shared=False, reason="build_timeout",

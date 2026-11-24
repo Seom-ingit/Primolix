@@ -57,3 +57,73 @@ def hit_span(text: str, query: str) -> tuple[int, int] | None:
     if not ranges:
         return None
     return (min(r[0] for r in ranges), max(r[1] for r in ranges))
+
+
+def span_compactness(text: str, q_terms) -> dict:
+    """原语级位置紧凑度 P_pos：计算查询有效词项在文档内的覆盖与最小聚集跨度 ∈ [0, 1]。"""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for t in q_terms:
+        tl = str(t).strip().lower()
+        if not tl or tl in seen or not any(ch.isalnum() for ch in tl):
+            continue
+        seen.add(tl)
+        terms.append(tl)
+    n_q = len(terms)
+    if n_q == 0 or not text:
+        return dict(matched_terms_n=0, q_terms_n=n_q, coverage=0.0,
+                    min_window_chars=0, proximity=0.0, compactness=0.0)
+
+    tl_doc = text.lower()
+    occs: list[tuple[int, int, int]] = []
+    matched_ids: set[int] = set()
+    matched_len_sum = 0
+    for tid, tok in enumerate(terms):
+        pos = tl_doc.find(tok)
+        if pos < 0:
+            continue
+        matched_ids.add(tid)
+        matched_len_sum += len(tok)
+        tlen = len(tok)
+        while pos >= 0:
+            occs.append((pos, pos + tlen, tid))
+            pos = tl_doc.find(tok, pos + 1)
+
+    n_hit = len(matched_ids)
+    if n_hit == 0:
+        return dict(matched_terms_n=0, q_terms_n=n_q, coverage=0.0,
+                    min_window_chars=0, proximity=0.0, compactness=0.0)
+
+    cov = n_hit / float(n_q)
+    if n_hit == 1:
+        prox = 1.0 if n_q == 1 else 0.25
+        win = matched_len_sum
+    else:
+        occs.sort(key=lambda x: (x[0], x[1]))
+        counts: dict[int, int] = {}
+        have = 0
+        left = 0
+        win = len(tl_doc) + 1
+        for _s, e, tid in occs:
+            if counts.get(tid, 0) == 0:
+                have += 1
+            counts[tid] = counts.get(tid, 0) + 1
+            while have == n_hit:
+                ls, _le, ltid = occs[left]
+                cur_win = e - ls
+                if cur_win < win:
+                    win = cur_win
+                counts[ltid] -= 1
+                if counts[ltid] == 0:
+                    have -= 1
+                left += 1
+        slack = max(0, win - matched_len_sum)
+        prox = 1.0 / (1.0 + slack / 80.0)
+    return dict(
+        matched_terms_n=n_hit,
+        q_terms_n=n_q,
+        coverage=round(cov, 4),
+        min_window_chars=int(win),
+        proximity=round(prox, 4),
+        compactness=round(cov * prox, 4),
+    )

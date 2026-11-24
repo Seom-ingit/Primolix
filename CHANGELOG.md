@@ -2,6 +2,16 @@
 
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 0.4.0 — 2026-11-24
+
+**零解压亚秒级冷启、分层 OOV 词表代理、Windows 零锁重构、代码/混合仓质量底座与可选 INT8 并池（`primolix_mcp` 独立分发，不随主包捆绑）。**
+
+- **冷启零解压与元数据二进制缓存（P0）**：`SparseBM25.load()` 先校验 `.mm/` 世代键与形状再决定是否触碰压缩矩阵；`_MetaSeq` 新增紧凑二进制缓存 `.meta.cache`（`PMXMC1` + `mtime_ns`/`size` 校验 + 损坏自愈）。1M 中文内核加载从 `0.340 s` 压到 `0.008 s`（`41.4x`），`_meta` 加载从 `6.31 s` 压到 `0.19 s`（`33x`）。
+- **分层词表代理、双缓冲写回与统一压实（P1/P2）**：`OverlayVocab` 承接挂段/delta 新增词而不把 `VocabMmap` 退回全量 Python dict；`save()` 采用临时目录双缓冲切换并显式释放 Windows mmap 句柄；统一 `Index.compact(mode='auto')` 与 `_reclaim_dead_rows()` 物理回收墓碑；`Index.warmup(shared=True)` 支持父进程共享只读 CSC 预热；`Index.health()` 暴露词汇载体、死行比例与共享状态。
+- **切块、上下文面包屑与底层检索质量（Layer 1 & 2）**：`chunk_prose()` 保留 `< 20` 字 Markdown 标题并与所属正文合并、`chunk_code()` 对 Python 走 `ast` 函数/类边界与 8 行重叠滑窗；`extract_chunk_contexts()` 为续块索引仅注入祖先 `#/##` 或 `class/def` 签名（不修改原文切片与 `char_start/char_end`）；`span_compactness()` 与 `confidence.py` 标点过滤/半 OOV 保护上线；`primolix/scope.py` 提供 `ScopeGraph` 文件拓扑路由。
+- **查询期批式重排与严格可选 `DenseInt8Sidecar`（`v0.3`–`v0.4`）**：`primolix/rerank.py` 提供批式去重流式编码、内存热缓存（`cache_view=True`）及 `cos` / `z2` / `z2_pos` / `z2_safe`（Top-32 局部防噪声反超）/ `z2_pool` 融合模式；新增 `primolix/dense_int8.py` 与 `Index.build_dense_int8()` / `Index.search(..., dense_union=True)`，默认零 dense 编码，缺失侧车/缺依赖/文件损坏时一律优雅降级为 BM25 并记录 `rerank_status`。
+- **Python 3.9–3.14 兼容与测试扩展**：补全全部模块 `from __future__ import annotations`，主包测试集扩展至 16 个顶层脚本套件，CI 覆盖 Python 3.9/3.11/3.12/3.13。
+
 ## 0.2.4 — 2026-11-18
 
 **结构侧三轴主线收口＋增量持久化成为默认。** 全部读数 @1M（N≈99.9 万 · 20k 文件 · 16 逻辑核）。

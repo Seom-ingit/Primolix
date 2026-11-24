@@ -38,17 +38,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
-      - name: Byte-compile the package
+      - name: Byte-compile packages
         run: python -m compileall -q primolix
 
-      - name: End-to-end test
-        run: python tests/test_primolix_e2e.py
-
-      - name: Kernel unit tests
-        run: python tests/test_kernel_unit.py
-
-      - name: Staged publish tests
-        run: python tests/test_staged_publish.py
+      - name: Run test suites
+        run: |
+          for f in tests/test_*.py; do
+            echo "=== Running $f ==="
+            python "$f"
+          done
 
       - name: Runnable example
         run: python examples/run_examples.py
